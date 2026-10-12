@@ -1124,8 +1124,20 @@ int performRtspHandshake(PSERVER_INFORMATION serverInfo) {
         // PyroWave is only ever requested explicitly by the client, so it takes
         // precedence whenever the host advertises it. Some PyroWave hosts omit the
         // "PYROWAVE/90000" DESCRIBE marker, so the capability bits decide.
-        if ((StreamConfig.supportedVideoFormats & VIDEO_FORMAT_MASK_PYROWAVE) &&
-                (serverInfo->serverCodecModeSupport & SCM_PYROWAVE)) {
+        //
+        // The PyroWave bitstream has no version field, and a decoder built from
+        // another pyrowave commit can misread every frame without noticing. So
+        // PyroWave is only selected when the host names the revision we decode;
+        // otherwise the conventional codecs below take over.
+        bool pyroWaveOffered = (StreamConfig.supportedVideoFormats & VIDEO_FORMAT_MASK_PYROWAVE) &&
+                               (serverInfo->serverCodecModeSupport & SCM_PYROWAVE);
+        if (pyroWaveOffered && strcmp(hostPyroWaveBitstreamId, PYROWAVE_BITSTREAM_ID) != 0) {
+            Limelog("PyroWave host bitstream revision is '%s', this client decodes %s: using another codec\n",
+                    hostPyroWaveBitstreamId, PYROWAVE_BITSTREAM_ID);
+            pyroWaveOffered = false;
+        }
+
+        if (pyroWaveOffered) {
             if ((serverInfo->serverCodecModeSupport & SCM_PYROWAVE_HDR10_444) && (StreamConfig.supportedVideoFormats & VIDEO_FORMAT_PYROWAVE_HDR10_444)) {
                 NegotiatedVideoFormat = VIDEO_FORMAT_PYROWAVE_HDR10_444;
             }
@@ -1137,14 +1149,6 @@ int performRtspHandshake(PSERVER_INFORMATION serverInfo) {
             }
             else {
                 NegotiatedVideoFormat = VIDEO_FORMAT_PYROWAVE;
-            }
-
-            if (hostPyroWaveBitstreamId[0] == '\0') {
-                Limelog("PyroWave host did not advertise its bitstream revision (expected %s)\n", PYROWAVE_BITSTREAM_ID);
-            }
-            else if (strcmp(hostPyroWaveBitstreamId, PYROWAVE_BITSTREAM_ID) != 0) {
-                Limelog("WARNING: PyroWave bitstream revision mismatch (host %s, client %s)\n",
-                        hostPyroWaveBitstreamId, PYROWAVE_BITSTREAM_ID);
             }
         }
         else if ((StreamConfig.supportedVideoFormats & VIDEO_FORMAT_MASK_AV1) && strstr(response.payload, "AV1/90000")) {
