@@ -1773,13 +1773,15 @@ bool LiGetEstimatedRttInfo(uint32_t* estimatedRtt, uint32_t* estimatedRttVarianc
 int LiGetControlStreamSilenceMs(void) {
     int ret = -1;
 
-    // Unlike LiGetEstimatedRttInfo(), this takes enetMutex: ENet updates
-    // lastReceiveTime from the receive thread for every packet from the host.
-    PltLockMutex(&enetMutex);
+    // Like LiGetEstimatedRttInfo(), this does not acquire enetMutex. Clients
+    // poll it from their UI thread, and the receive thread can hold enetMutex
+    // for up to a second while a disconnect is pending. A torn read of
+    // lastReceiveTime is harmless for a value measured in seconds, and the
+    // peer points to memory inside the client object, which stays valid until
+    // LiStopConnection().
     if (peer != NULL && peer->state == ENET_PEER_STATE_CONNECTED) {
         ret = (int)ENET_TIME_DIFFERENCE(enet_time_get(), peer->lastReceiveTime);
     }
-    PltUnlockMutex(&enetMutex);
 
     return ret;
 }

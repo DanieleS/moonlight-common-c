@@ -104,8 +104,12 @@ typedef struct _STREAM_CONFIGURATION {
     // How long (in milliseconds) the control stream may go without hearing
     // from the host before the connection is declared dead and terminated
     // with an error. 0 keeps the default of 10 seconds. A longer timeout lets
-    // the stream ride out a short network drop, but the host has a timeout of
-    // its own (Sunshine's ping_timeout), and the shorter of the two wins.
+    // the stream ride out a short network drop, but the host has timeouts of
+    // its own (Sunshine's ping_timeout, and the ENet peer timeout of its
+    // control server), and the smallest one wins. Stock Sunshine does not set
+    // its ENet peer timeout, so ENet's defaults apply: on a LAN the host lets
+    // go of a silent client after about 5 seconds, and a longer timeout here
+    // only helps against a host that holds the client for longer.
     int controlPeerTimeoutMs;
 } STREAM_CONFIGURATION, *PSTREAM_CONFIGURATION;
 
