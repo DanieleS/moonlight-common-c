@@ -1199,6 +1199,17 @@ int performRtspHandshake(PSERVER_INFORMATION serverInfo) {
             }
         }
 
+        // The PyroWave budget is no sensible AV1/HEVC/H.264 bitrate: switch to the
+        // conventional one before the ANNOUNCE below asks the host for it.
+        if ((StreamConfig.supportedVideoFormats & VIDEO_FORMAT_MASK_PYROWAVE) &&
+                !(NegotiatedVideoFormat & VIDEO_FORMAT_MASK_PYROWAVE) &&
+                StreamConfig.pyroWaveFallbackBitrate > 0 &&
+                StreamConfig.bitrate != StreamConfig.pyroWaveFallbackBitrate) {
+            Limelog("PyroWave not negotiated: using the conventional bitrate of %d Kbps instead of the PyroWave budget of %d Kbps\n",
+                    StreamConfig.pyroWaveFallbackBitrate, StreamConfig.bitrate);
+            StreamConfig.bitrate = StreamConfig.pyroWaveFallbackBitrate;
+        }
+
         // Look for the SDP attribute that indicates we're dealing with a server that supports RFI
         ReferenceFrameInvalidationSupported = strstr(response.payload, "x-nv-video[0].refPicInvalidation") != NULL;
         if (!ReferenceFrameInvalidationSupported) {
