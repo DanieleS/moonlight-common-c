@@ -100,6 +100,13 @@ typedef struct _STREAM_CONFIGURATION {
     // in /launch and /resume requests.
     char remoteInputAesKey[16];
     char remoteInputAesIv[16];
+
+    // How long (in milliseconds) the control stream may go without hearing
+    // from the host before the connection is declared dead and terminated
+    // with an error. 0 keeps the default of 10 seconds. A longer timeout lets
+    // the stream ride out a short network drop, but the host has a timeout of
+    // its own (Sunshine's ping_timeout), and the shorter of the two wins.
+    int controlPeerTimeoutMs;
 } STREAM_CONFIGURATION, *PSTREAM_CONFIGURATION;
 
 // Use this function to zero the stream configuration when allocated on the stack or heap
@@ -568,6 +575,14 @@ const char* LiGetStageName(int stage);
 // ENet for the control stream (very old versions), or if the ENet peer is not connected.
 // This function may only be called between LiStartConnection() and LiStopConnection().
 bool LiGetEstimatedRttInfo(uint32_t* estimatedRtt, uint32_t* estimatedRttVariance);
+
+// This function returns the number of milliseconds since anything was last received
+// from the host on the control stream. The client pings the host several times a
+// second, so on a healthy link this stays well under a second, and a growing value
+// means the network has gone quiet. It returns -1 if the control stream does not
+// use ENet (very old GFE versions) or if the ENet peer is not connected.
+// This function may only be called between LiStartConnection() and LiStopConnection().
+int LiGetControlStreamSilenceMs(void);
 
 // This function sends a request to the server to execute the requested cmd id.
 int LiSendExecServerCmd(uint8_t cmdId);
