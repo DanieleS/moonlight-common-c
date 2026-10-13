@@ -83,6 +83,9 @@ typedef struct _QUEUED_ASYNC_CALLBACK {
             uint8_t left[DS_EFFECT_PAYLOAD_SIZE];
             uint8_t right[DS_EFFECT_PAYLOAD_SIZE];
         } dsAdaptiveTrigger;
+        struct {
+            uint8_t focusType;
+        } setTextFocus;
     } data;
     LINKED_BLOCKING_QUEUE_ENTRY entry;
 } QUEUED_ASYNC_CALLBACK, *PQUEUED_ASYNC_CALLBACK;
@@ -105,6 +108,10 @@ static bool disconnectPending;
 static bool encryptedControlStream;
 static bool hdrEnabled;
 static SS_HDR_METADATA hdrMetadata;
+
+// Only touched on the control stream receive thread, and reset before it starts
+static uint32_t lastTextFocusSequence;
+static bool loggedTextFocusRejection;
 
 static int intervalGoodFrameCount;
 static int intervalTotalFrameCount;
@@ -143,6 +150,7 @@ static PPLT_CRYPTO_CONTEXT decryptionCtx;
 #define IDX_SET_CLIPBOARD 13
 #define IDX_FILE_TRANSFER_NONCE_REQUEST 14
 #define IDX_DS_ADAPTIVE_TRIGGERS 15
+#define IDX_TEXT_FOCUS 16
 
 #define CONTROL_STREAM_TIMEOUT_SEC 10
 #define CONTROL_STREAM_LINGER_TIMEOUT_SEC 2
@@ -164,6 +172,7 @@ static const short packetTypesGen3[] = {
     -1,     // Set Clipboard (unused)
     -1,     // File transfer nonce request (unused)
     -1,     // Set Adaptive Triggers (unused)
+    -1,     // Text field focus (unused)
 };
 static const short packetTypesGen4[] = {
     0x0606, // Request IDR frame
@@ -182,6 +191,7 @@ static const short packetTypesGen4[] = {
     -1,     // Set Clipboard (unused)
     -1,     // File transfer nonce request (unused)
     -1,     // Set Adaptive Triggers (unused)
+    -1,     // Text field focus (unused)
 };
 static const short packetTypesGen5[] = {
     0x0305, // Start A
@@ -200,6 +210,7 @@ static const short packetTypesGen5[] = {
     -1,     // Set Clipboard (unused)
     -1,     // File transfer nonce request (unused)
     -1,     // Set Adaptive Triggers (unused)
+    -1,     // Text field focus (unused)
 };
 static const short packetTypesGen7[] = {
     0x0305, // Start A
@@ -218,6 +229,7 @@ static const short packetTypesGen7[] = {
     -1,     // Set Clipboard (unused)
     -1,     // File transfer nonce request (unused)
     -1,     // Set Adaptive Triggers (unused)
+    -1,     // Text field focus (unused)
 };
 static const short packetTypesGen7Enc[] = {
     0x0302, // Request IDR frame
@@ -236,6 +248,7 @@ static const short packetTypesGen7Enc[] = {
     0x3001, // Set Clipboard (Apollo protocol extension)
     0x3002, // File transfer nonce request (Apollo protocol extension)
     0x5503, // Set Adaptive Triggers (Sunshine protocol extension)
+    SS_TEXT_FOCUS_PTYPE, // Text field focus (Vibepollo protocol extension)
 };
 
 static const char requestIdrFrameGen3[] = { 0, 0 };
@@ -365,6 +378,8 @@ int initializeControlStream(void) {
 
     lastGoodFrame = 0;
     lastSeenFrame = 0;
+    lastTextFocusSequence = 0;
+    loggedTextFocusRejection = false;
     disconnectPending = false;
     intervalGoodFrameCount = 0;
     intervalTotalFrameCount = 0;
@@ -1032,6 +1047,22 @@ static void asyncCallbackThreadFunc(void* context) {
                                                   queuedCb->data.dsAdaptiveTrigger.left,
                                                   queuedCb->data.dsAdaptiveTrigger.right);
             break;
+        case IDX_TEXT_FOCUS:
+            // Focus is a state, so only the newest report matters. Collapse any queued
+            // behind this one rather than flashing a keyboard through each of them.
+            while (LbqPeekQueueElement(&asyncCallbackQueue, (void**)&nextCb) == LBQ_SUCCESS && nextCb->typeIndex == queuedCb->typeIndex) {
+                // This entry is batchable, so pop it off the queue
+                if (LbqPollQueueElement(&asyncCallbackQueue, (void**)&nextCb) != LBQ_SUCCESS) {
+                    break;
+                }
+
+                // Replace the old entry with the new one
+                free(queuedCb);
+                queuedCb = nextCb;
+            }
+
+            ListenerCallbacks.setTextFocus(queuedCb->data.setTextFocus.focusType);
+            break;
         default:
             // Unhandled packet type from queueAsyncCallback()
             LC_ASSERT(false);
@@ -1050,7 +1081,8 @@ static bool needsAsyncCallback(unsigned short packetType) {
            packetType == packetTypes[IDX_HDR_INFO] ||
            packetType == packetTypes[IDX_SET_CLIPBOARD] ||
            packetType == packetTypes[IDX_FILE_TRANSFER_NONCE_REQUEST] ||
-           packetType == packetTypes[IDX_DS_ADAPTIVE_TRIGGERS];
+           packetType == packetTypes[IDX_DS_ADAPTIVE_TRIGGERS] ||
+           packetType == packetTypes[IDX_TEXT_FOCUS];
 }
 
 static void queueAsyncCallback(PNVCTL_ENET_PACKET_HEADER_V1 ctlHdr, int packetLength) {
@@ -1110,6 +1142,49 @@ static void queueAsyncCallback(PNVCTL_ENET_PACKET_HEADER_V1 ctlHdr, int packetLe
         BbGetBytes(&bb, queuedCb->data.dsAdaptiveTrigger.left, DS_EFFECT_PAYLOAD_SIZE);
         BbGetBytes(&bb, queuedCb->data.dsAdaptiveTrigger.right, DS_EFFECT_PAYLOAD_SIZE);
         queuedCb->typeIndex = IDX_DS_ADAPTIVE_TRIGGERS;
+    }
+    else if (ctlHdr->type == packetTypes[IDX_TEXT_FOCUS]) {
+        uint8_t version, focusType;
+        uint16_t reserved;
+        uint32_t sequenceNumber;
+
+        // Only act on reports we asked for, from a host that said it would send them.
+        // Anything else means one side disagrees about the extension, and guessing is
+        // how a keyboard ends up stuck on screen.
+        if (!StreamConfig.enableTextFocusHints || !(SunshineFeatureFlags & LI_FF_TEXT_FOCUS) ||
+                packetLength - (int)sizeof(*ctlHdr) < SS_TEXT_FOCUS_MIN_PAYLOAD_SIZE) {
+            if (!loggedTextFocusRejection) {
+                loggedTextFocusRejection = true;
+                Limelog("Ignoring text focus report (requested: %d, host flags: 0x%x, length: %d)\n",
+                        StreamConfig.enableTextFocusHints ? 1 : 0, SunshineFeatureFlags,
+                        packetLength - (int)sizeof(*ctlHdr));
+            }
+            free(queuedCb);
+            return;
+        }
+
+        BbGet8(&bb, &version);
+        BbGet8(&bb, &focusType);
+        BbGet16(&bb, &reserved);
+        BbGet32(&bb, &sequenceNumber);
+
+        // The control stream is reliable and ordered, so a stale report should never
+        // arrive; it is dropped anyway, because acting on one could raise a keyboard
+        // after focus has already left the field. Version 0 was never sent.
+        if (version == 0 || sequenceNumber <= lastTextFocusSequence) {
+            free(queuedCb);
+            return;
+        }
+        lastTextFocusSequence = sequenceNumber;
+
+        // A kind from a newer host is read as "nothing focused", so whatever keyboard
+        // is already up comes down rather than staying up for a field we can't classify.
+        if (focusType > LI_TEXT_FOCUS_PASSWORD) {
+            focusType = LI_TEXT_FOCUS_NONE;
+        }
+
+        queuedCb->data.setTextFocus.focusType = focusType;
+        queuedCb->typeIndex = IDX_TEXT_FOCUS;
     }
     else {
         // Unhandled packet type from needsAsyncCallback()
