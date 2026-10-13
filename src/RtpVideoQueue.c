@@ -756,10 +756,18 @@ bool RtpvExpirePendingFrame(PRTP_VIDEO_QUEUE queue, uint64_t nowUs) {
     }
 
     reportFinalFrameFecStatus(queue);
+    // Counted before completeBlockWithLostPackets() leaves the pending block, and
+    // recorded only once it succeeds: a block that stays pending is counted when
+    // the next boundary resolves it instead.
+    uint32_t dataPackets = queue->bufferDataPackets;
+    uint32_t missingDataPackets = queue->bufferDataPackets - queue->receivedDataPackets;
     if (!completeBlockWithLostPackets(queue, queue->pendingFrameDeadlinePrecise ?
                                       "on-time deadline" : "packet silence")) {
         return false;
     }
+    // A block delivered with holes on the deadline lost packets the dynamic FEC
+    // summary must hear about, like one resolved at the next boundary
+    connectionRecordVideoLoss(dataPackets, missingDataPackets);
     submitCompletedFrame(queue);
     queue->currentFrameNumber++;
     queue->multiFecCurrentBlockNumber = 0;
