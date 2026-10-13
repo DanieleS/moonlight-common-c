@@ -1141,6 +1141,13 @@ bool LiGetHdrMetadata(PSS_HDR_METADATA metadata);
 // Valid after the RTSP handshake. This is a Sunshine protocol extension.
 const char* LiGetHostPyroWaveBitstreamId(void);
 
+// Returns true when dynamic FEC was negotiated for this stream: videoFecMode was not
+// LI_FEC_DISABLED, the host advertised x-ss-video[0].fecControlVersion:1, and PyroWave
+// was not negotiated. The client then sends loss summaries, and unless videoFecMode is
+// LI_FEC_HOST_DEFAULT the host takes video parity out of the video budget instead of
+// out of the configured bitrate. Valid after the RTSP handshake.
+bool LiIsDynamicFecNegotiated(void);
+
 // This function requests an IDR frame from the host. Typically this is done using DR_NEED_IDR, but clients
 // processing frames asynchronously may need to reset their decoder state even after returning DR_OK for
 // the prior frame. Rather than wait for a new frame and return DR_NEED_IDR for that one, they can just

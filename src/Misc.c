@@ -155,3 +155,7 @@ uint64_t LiGetMicroseconds(void) {
 uint32_t LiGetHostFeatureFlags(void) {
     return SunshineFeatureFlags;
 }
+
+bool LiIsDynamicFecNegotiated(void) {
+    return VideoFecControlSupported;
+}
