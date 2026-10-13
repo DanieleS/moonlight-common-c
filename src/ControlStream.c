@@ -101,9 +101,6 @@ static uint32_t fecSummaryDataPackets;
 static uint32_t fecSummaryMissingPackets;
 static uint32_t fecSummarySequence;
 static uint64_t fecSummaryLastSentMs;
-static bool fecSummaryHasLastBlock;
-static uint32_t fecSummaryLastFrame;
-static uint8_t fecSummaryLastBlock;
 
 static PLT_THREAD lossStatsThread;
 static PLT_THREAD invalidateRefFramesThread;
@@ -341,7 +338,6 @@ int initializeControlStream(void) {
     PltCreateMutex(&enetMutex);
     PltCreateMutex(&fecSummaryMutex);
     fecSummaryDataPackets = fecSummaryMissingPackets = fecSummarySequence = 0;
-    fecSummaryHasLastBlock = false;
     fecSummaryLastSentMs = PltGetMillis();
 
     encryptedControlStream = APP_VERSION_AT_LEAST(7, 1, 431);
@@ -491,21 +487,17 @@ void connectionReceivedCompleteFrame(uint32_t frameIndex, bool frameIsLTR) {
     }
 }
 
-// Count one FEC block that was completed, recovered or dropped, for the dynamic FEC summary.
-// The RTP queue can report the same block twice, so only the first report counts.
-void connectionRecordFecBlock(uint32_t frameIndex, uint8_t blockIndex, uint32_t dataPackets, uint32_t receivedDataPackets) {
-    if (!VideoFecControlSupported || dataPackets == 0 || receivedDataPackets > dataPackets) {
+// Count data shards and how many of them were lost, for the dynamic FEC summary.
+// The RTP queue calls this once per FEC block, and once per run of lost blocks.
+void connectionRecordVideoLoss(uint32_t dataPackets, uint32_t missingDataPackets) {
+    if (!VideoFecControlSupported || dataPackets == 0 || missingDataPackets > dataPackets) {
         return;
     }
 
     PltLockMutex(&fecSummaryMutex);
-    if ((!fecSummaryHasLastBlock || frameIndex != fecSummaryLastFrame || blockIndex != fecSummaryLastBlock) &&
-            dataPackets <= FEC_SUMMARY_MAX_DATA_PACKETS - fecSummaryDataPackets) {
+    if (dataPackets <= FEC_SUMMARY_MAX_DATA_PACKETS - fecSummaryDataPackets) {
         fecSummaryDataPackets += dataPackets;
-        fecSummaryMissingPackets += dataPackets - receivedDataPackets;
-        fecSummaryLastFrame = frameIndex;
-        fecSummaryLastBlock = blockIndex;
-        fecSummaryHasLastBlock = true;
+        fecSummaryMissingPackets += missingDataPackets;
     }
     PltUnlockMutex(&fecSummaryMutex);
 }

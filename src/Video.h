@@ -58,7 +58,7 @@ typedef struct _SS_PING {
 #define SS_FEC_SUMMARY_PTYPE 0x5510
 typedef struct _SS_FEC_SUMMARY {
     uint32_t sequence; // Increments every summary period, sent or not
-    uint32_t dataPackets; // Data shards of the FEC blocks finished or dropped this period
+    uint32_t dataPackets; // Data shards of the FEC blocks finished, dropped or lost whole this period
     uint32_t missingDataPackets; // Of those, the ones missing before FEC recovery
 } SS_FEC_SUMMARY, *PSS_FEC_SUMMARY;
 
