@@ -93,6 +93,10 @@ static void removeEntryFromList(PRTPV_QUEUE_LIST list, PRTPV_QUEUE_ENTRY entry) 
 static void reportFinalFrameFecStatus(PRTP_VIDEO_QUEUE queue) {
     SS_FRAME_FEC_STATUS fecStatus;
 
+    // Recovered and dropped blocks count toward the dynamic FEC loss summary
+    connectionRecordFecBlock(queue->currentFrameNumber, queue->multiFecCurrentBlockNumber,
+                             queue->bufferDataPackets, queue->receivedDataPackets);
+
     fecStatus.frameIndex = BE32(queue->currentFrameNumber);
     fecStatus.highestReceivedSequenceNumber = BE16(queue->receivedHighestSequenceNumber);
     fecStatus.nextContiguousSequenceNumber = BE16(queue->nextContiguousSequenceNumber);
@@ -247,6 +251,10 @@ static int reconstructFrame(PRTP_VIDEO_QUEUE queue) {
 #else
     if (queue->receivedDataPackets == queue->bufferDataPackets) {
 #endif
+        // Blocks that arrived whole count toward the loss summary too, as zero missing.
+        connectionRecordFecBlock(queue->currentFrameNumber, queue->multiFecCurrentBlockNumber,
+                                 queue->bufferDataPackets, queue->receivedDataPackets);
+
         // We've received a full frame with no need for FEC.
         return 0;
     }

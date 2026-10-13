@@ -32,6 +32,7 @@ extern OPUS_MULTISTREAM_CONFIGURATION HighQualityOpusConfig;
 extern int AudioPacketDuration;
 extern bool AudioEncryptionEnabled;
 extern bool ReferenceFrameInvalidationSupported;
+extern bool VideoFecControlSupported;
 
 extern uint16_t RtspPortNumber;
 extern uint16_t ControlPortNumber;
@@ -123,6 +124,7 @@ void connectionDetectedFrameLoss(uint32_t startFrame, uint32_t endFrame);
 void connectionReceivedCompleteFrame(uint32_t frameIndex, bool frameIsLTR);
 void connectionSawFrame(uint32_t frameIndex);
 void connectionSendFrameFecStatus(PSS_FRAME_FEC_STATUS fecStatus);
+void connectionRecordFecBlock(uint32_t frameIndex, uint8_t blockIndex, uint32_t dataPackets, uint32_t receivedDataPackets);
 int sendInputPacketOnControlStream(unsigned char* data, int length, uint8_t channelId, uint32_t flags, bool moreData);
 void flushInputOnControlStream(void);
 bool isControlDataInTransit(void);

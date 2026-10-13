@@ -54,6 +54,15 @@ typedef struct _SS_PING {
 } SS_PING, *PSS_PING;
 
 // Fields are big-endian
+// Loss summary for dynamic FEC, sent once a second when the host supports it
+#define SS_FEC_SUMMARY_PTYPE 0x5510
+typedef struct _SS_FEC_SUMMARY {
+    uint32_t sequence; // Increments every summary period, sent or not
+    uint32_t dataPackets; // Data shards of the FEC blocks finished or dropped this period
+    uint32_t missingDataPackets; // Of those, the ones missing before FEC recovery
+} SS_FEC_SUMMARY, *PSS_FEC_SUMMARY;
+
+// Fields are big-endian
 #define SS_FRAME_FEC_PTYPE 0x5502
 typedef struct _SS_FRAME_FEC_STATUS {
     uint32_t frameIndex;

@@ -35,6 +35,12 @@ extern "C" {
 #define ENCFLG_VIDEO 0x00000002
 #define ENCFLG_ALL   0xFFFFFFFF
 
+// Values for STREAM_CONFIGURATION.videoFecMode
+#define LI_FEC_DISABLED     0 // Don't negotiate dynamic FEC; the host keeps its fixed FEC
+#define LI_FEC_HOST_DEFAULT 1 // Send loss summaries, but let the host's own setting decide
+#define LI_FEC_AUTOMATIC    2 // Let the host tune FEC from this client's loss summaries
+#define LI_FEC_FIXED        3 // Ask for videoFecPercentage for this session
+
 // This function returns a string that you SHOULD append to the /launch and /resume
 // query parameter string. This is used to enable certain extended functionality
 // with Sunshine hosts. The returned string is owned by moonlight-common-c and
@@ -100,6 +106,16 @@ typedef struct _STREAM_CONFIGURATION {
     // in /launch and /resume requests.
     char remoteInputAesKey[16];
     char remoteInputAesIv[16];
+
+    // Dynamic video FEC, one of the LI_FEC_* values. When the host advertises
+    // x-ss-video[0].fecControlVersion:1 and this isn't LI_FEC_DISABLED, the client
+    // asks for this mode and sends the host a loss summary every second (control
+    // message 0x5510). With LI_FEC_DISABLED (zero) or any other host, nothing is
+    // negotiated and the host keeps its fixed FEC percentage.
+    int videoFecMode;
+
+    // The FEC percentage (0-100) to ask for with LI_FEC_FIXED. Ignored otherwise.
+    int videoFecPercentage;
 } STREAM_CONFIGURATION, *PSTREAM_CONFIGURATION;
 
 // Use this function to zero the stream configuration when allocated on the stack or heap
