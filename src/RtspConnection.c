@@ -1216,8 +1216,13 @@ int performRtspHandshake(PSERVER_INFORMATION serverInfo) {
             Limelog("Reference frame invalidation is not supported by this host\n");
         }
 
-        // Dynamic FEC needs a host that takes our loss summaries on the encrypted control stream
-        if (StreamConfig.videoFecMode != LI_FEC_DISABLED && IS_SUNSHINE() && APP_VERSION_AT_LEAST(7, 1, 431)) {
+        // Dynamic FEC needs a host that takes our loss summaries on the encrypted control stream.
+        // PyroWave protects only its critical packets with parity of its own, and hosts never run
+        // dynamic FEC for it, so a PyroWave stream doesn't ask for it or send summaries.
+        if (StreamConfig.videoFecMode != LI_FEC_DISABLED && (NegotiatedVideoFormat & VIDEO_FORMAT_MASK_PYROWAVE)) {
+            Limelog("Dynamic FEC is not used with PyroWave\n");
+        }
+        else if (StreamConfig.videoFecMode != LI_FEC_DISABLED && IS_SUNSHINE() && APP_VERSION_AT_LEAST(7, 1, 431)) {
             uint32_t fecControlVersion;
             VideoFecControlSupported =
                 parseSdpAttributeToUInt(response.payload, "x-ss-video[0].fecControlVersion", &fecControlVersion) &&
