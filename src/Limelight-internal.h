@@ -88,6 +88,17 @@ extern uint32_t EncryptionFeaturesEnabled;
 // Client feature flags for x-ml-general.featureFlags SDP attribute
 #define ML_FF_FEC_STATUS 0x01 // Client sends SS_FRAME_FEC_STATUS for frame losses
 #define ML_FF_SESSION_ID_V1 0x02 // Client supports X-SS-Ping-Payload and X-SS-Connect-Data
+// Vibepollo extension: client wants SS_TEXT_FOCUS_PTYPE messages. Deliberately far from
+// the low bits, which upstream allocates in order and other forks already use (0x04 and
+// 0x08 carry DualSense haptics in Vibeshine and Moonlight V+, 0x10 remote text context).
+// The host's LI_FF_TEXT_FOCUS sits at the same bit for the same reason.
+#define ML_FF_TEXT_FOCUS 0x10000
+
+// Vibepollo extension: host -> client text field focus. The payload is little endian:
+// version (u8), focus type (u8), reserved (u16), sequence number (u32). A later version
+// may append fields, so only shorter payloads are malformed.
+#define SS_TEXT_FOCUS_PTYPE 0x3020
+#define SS_TEXT_FOCUS_MIN_PAYLOAD_SIZE 8
 
 #define UDP_RECV_POLL_TIMEOUT_MS 100
 

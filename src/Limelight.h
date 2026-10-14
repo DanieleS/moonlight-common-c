@@ -119,6 +119,14 @@ typedef struct _STREAM_CONFIGURATION {
     // go of a silent client after about 5 seconds, and a longer timeout here
     // only helps against a host that holds the client for longer.
     int controlPeerTimeoutMs;
+
+    // Set to true to ask the host to report when a text field takes or loses
+    // focus on its desktop, through ConnListenerSetTextFocus(). This is a request,
+    // not a local preference: the host only starts watching focus for a client
+    // that asks, so leave it false unless the client will act on the reports.
+    // Hosts without the extension ignore the request and the callback is never
+    // invoked. This is a Vibepollo protocol extension.
+    bool enableTextFocusHints;
 } STREAM_CONFIGURATION, *PSTREAM_CONFIGURATION;
 
 // Use this function to zero the stream configuration when allocated on the stack or heap
@@ -539,6 +547,25 @@ typedef void(*ConnListenerSetAdaptiveTriggers)(uint16_t controllerNumber, uint8_
 // This callback is invoked to set a controller's RGB LED (if present).
 typedef void(*ConnListenerSetControllerLED)(uint16_t controllerNumber, uint8_t r, uint8_t g, uint8_t b);
 
+// Kinds of focused element reported by ConnListenerSetTextFocus()
+#define LI_TEXT_FOCUS_NONE     0x00 // Nothing that takes text has focus
+#define LI_TEXT_FOCUS_TEXT     0x01 // An ordinary text field has focus
+#define LI_TEXT_FOCUS_NUMERIC  0x02 // A field that only takes digits has focus
+#define LI_TEXT_FOCUS_PASSWORD 0x03 // A password field has focus
+
+// This callback is invoked when the host reports that a text field took or lost
+// focus on its desktop, so the client can raise or dismiss an on-screen keyboard.
+// It is a state, not an event: each call describes what has focus now, and the
+// newest call always wins. focusType is one of LI_TEXT_FOCUS_*; a kind added by a
+// newer host is reported as LI_TEXT_FOCUS_NONE, so a keyboard is never left up
+// for a field the client does not understand.
+//
+// Only invoked when STREAM_CONFIGURATION.enableTextFocusHints was set and the host
+// advertised LI_FF_TEXT_FOCUS. Like the other listener callbacks it runs on the
+// async callback thread, not the control stream receive thread.
+// This is a Vibepollo protocol extension.
+typedef void(*ConnListenerSetTextFocus)(uint8_t focusType);
+
 typedef struct _CONNECTION_LISTENER_CALLBACKS {
     ConnListenerStageStarting stageStarting;
     ConnListenerStageComplete stageComplete;
@@ -553,6 +580,7 @@ typedef struct _CONNECTION_LISTENER_CALLBACKS {
     ConnListenerSetMotionEventState setMotionEventState;
     ConnListenerSetControllerLED setControllerLED;
     ConnListenerSetAdaptiveTriggers setAdaptiveTriggers;
+    ConnListenerSetTextFocus setTextFocus;
 } CONNECTION_LISTENER_CALLBACKS, *PCONNECTION_LISTENER_CALLBACKS;
 
 // Use this function to zero the connection callbacks when allocated on the stack or heap
@@ -1107,6 +1135,7 @@ void LiRequestIdrFrame(void);
 // This function returns any extended feature flags supported by the host.
 #define LI_FF_PEN_TOUCH_EVENTS        0x01 // LiSendTouchEvent()/LiSendPenEvent() supported
 #define LI_FF_CONTROLLER_TOUCH_EVENTS 0x02 // LiSendControllerTouchEvent() supported
+#define LI_FF_TEXT_FOCUS              0x10000 // Host can report text field focus (ConnListenerSetTextFocus())
 uint32_t LiGetHostFeatureFlags(void);
 
 #ifdef __cplusplus
