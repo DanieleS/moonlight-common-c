@@ -1770,6 +1770,22 @@ bool LiGetEstimatedRttInfo(uint32_t* estimatedRtt, uint32_t* estimatedRttVarianc
     return ret;
 }
 
+int LiGetControlStreamSilenceMs(void) {
+    int ret = -1;
+
+    // Like LiGetEstimatedRttInfo(), this does not acquire enetMutex. Clients
+    // poll it from their UI thread, and the receive thread can hold enetMutex
+    // for up to a second while a disconnect is pending. A torn read of
+    // lastReceiveTime is harmless for a value measured in seconds, and the
+    // peer points to memory inside the client object, which stays valid until
+    // LiStopConnection().
+    if (peer != NULL && peer->state == ENET_PEER_STATE_CONNECTED) {
+        ret = (int)ENET_TIME_DIFFERENCE(enet_time_get(), peer->lastReceiveTime);
+    }
+
+    return ret;
+}
+
 // Starts the control stream
 int startControlStream(void) {
     int err;
@@ -1857,8 +1873,16 @@ int startControlStream(void) {
         // The 3DS can take a bit longer to set up when starting fresh
         enet_peer_timeout(peer, 2, 60000, 60000);
 #else
-        // Set the peer timeout to 10 seconds and limit backoff to 2x RTT
-        enet_peer_timeout(peer, 2, 10000, 10000);
+        // Set the peer timeout to 10 seconds (unless the client asked for
+        // something else) and limit backoff to 2x RTT
+        {
+            enet_uint32 peerTimeoutMs = StreamConfig.controlPeerTimeoutMs > 0 ?
+                (enet_uint32)StreamConfig.controlPeerTimeoutMs : 10000;
+            if (peerTimeoutMs != 10000) {
+                Limelog("Control stream peer timeout: %u ms\n", peerTimeoutMs);
+            }
+            enet_peer_timeout(peer, 2, peerTimeoutMs, peerTimeoutMs);
+        }
 #endif
     }
     else {
