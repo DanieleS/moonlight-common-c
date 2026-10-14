@@ -57,6 +57,10 @@ typedef struct _RTP_VIDEO_QUEUE {
     uint64_t lastOosFramePresentationTimestamp;
     bool receivedOosData;
 
+    // First sequence number after the last block the dynamic FEC loss summary accounted for
+    uint32_t lossSummaryNextSequenceNumber;
+    bool lossSummaryHasNextSequenceNumber;
+
     RTP_VIDEO_STATS stats; // the above values are short-lived, this tracks stats for the life of the queue
 } RTP_VIDEO_QUEUE, *PRTP_VIDEO_QUEUE;
 

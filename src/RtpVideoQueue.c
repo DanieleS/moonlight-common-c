@@ -770,6 +770,31 @@ uint32_t RtpvGetCurrentFrameNumber(PRTP_VIDEO_QUEUE queue) {
     return queue->currentFrameNumber;
 }
 
+// Count the packets of FEC blocks that never reached the queue toward the dynamic FEC loss summary.
+// Video sequence numbers run on across blocks and frames, so a jump past the last block accounted
+// for means whole blocks were lost. Their parity shards count as data, which slightly overstates loss.
+// Packets that arrive for a frame the queue already gave up on move the mark forward, so only
+// packets that never arrived count.
+static void recordSkippedVideoPackets(PRTP_VIDEO_QUEUE queue, uint16_t firstSequenceNumber, uint16_t nextSequenceNumber) {
+    if (queue->lossSummaryHasNextSequenceNumber) {
+        // Packets behind the mark are late arrivals from blocks already accounted for
+        if (!isBefore16(firstSequenceNumber, queue->lossSummaryNextSequenceNumber)) {
+            uint16_t skippedPackets = U16(firstSequenceNumber - queue->lossSummaryNextSequenceNumber);
+            if (skippedPackets != 0) {
+                connectionRecordVideoLoss(skippedPackets, skippedPackets);
+            }
+        }
+
+        // Never move the mark backwards
+        if (isBefore16(nextSequenceNumber, queue->lossSummaryNextSequenceNumber)) {
+            return;
+        }
+    }
+
+    queue->lossSummaryNextSequenceNumber = nextSequenceNumber;
+    queue->lossSummaryHasNextSequenceNumber = true;
+}
+
 int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_QUEUE_ENTRY packetEntry) {
     if (isBefore16(packet->sequenceNumber, queue->nextContiguousSequenceNumber)) {
         // Reject packets behind our current buffer window
@@ -806,6 +831,7 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
 #ifndef LC_FUZZING
     if (isBefore16(nvPacket->frameIndex, queue->currentFrameNumber)) {
         // Reject frames behind our current frame number
+        recordSkippedVideoPackets(queue, packet->sequenceNumber, U16(packet->sequenceNumber + 1));
         return RTPF_RET_REJECTED;
     }
 #endif
@@ -815,6 +841,7 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
 
     if (nvPacket->frameIndex == queue->currentFrameNumber && fecCurrentBlockNumber < queue->multiFecCurrentBlockNumber) {
         // Reject FEC blocks behind our current block number
+        recordSkippedVideoPackets(queue, packet->sequenceNumber, U16(packet->sequenceNumber + 1));
         return RTPF_RET_REJECTED;
     }
 
@@ -827,6 +854,7 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
         if (queue->pendingFecBlockList.count != 0) {
             // Report the final status of the FEC queue before dropping this frame
             reportFinalFrameFecStatus(queue);
+            connectionRecordVideoLoss(queue->bufferDataPackets, queue->bufferDataPackets - queue->receivedDataPackets);
 
             // PyroWave: once the next block of this frame or the next frame starts, the
             // incomplete block is delivered with its missing packets zero-filled. That
@@ -874,6 +902,7 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
                     queue->currentFrameNumber++;
                     queue->multiFecCurrentBlockNumber = 0;
                     queue->reportedLostFrame = false;
+                    recordSkippedVideoPackets(queue, packet->sequenceNumber, U16(packet->sequenceNumber + 1));
                     return RTPF_RET_REJECTED;
                 }
             }
@@ -914,6 +943,7 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
             queue->currentFrameNumber = nvPacket->frameIndex + 1;
             queue->multiFecCurrentBlockNumber = 0;
             queue->reportedLostFrame = false;
+            recordSkippedVideoPackets(queue, packet->sequenceNumber, U16(packet->sequenceNumber + 1));
             return RTPF_RET_REJECTED;
         }
 
@@ -963,6 +993,8 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
         queue->bufferHighestSequenceNumber = U16(queue->bufferFirstParitySequenceNumber + queue->bufferParityPackets - 1);
         queue->multiFecCurrentBlockNumber = fecCurrentBlockNumber;
         queue->multiFecLastBlockNumber = (nvPacket->multiFecBlocks >> 6) & 0x3;
+
+        recordSkippedVideoPackets(queue, queue->bufferLowestSequenceNumber, U16(queue->bufferHighestSequenceNumber + 1));
 
         queue->stats.packetCountVideo += queue->bufferDataPackets;
         queue->stats.packetCountFec += queue->bufferParityPackets;
@@ -1057,6 +1089,10 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
         // this will fail and we'll keep waiting.
         if (reconstructFrame(queue) == 0) {
             queue->pendingFrameDeadlineUs = 0;
+
+            // Blocks that arrived whole or were recovered count toward the loss summary
+            connectionRecordVideoLoss(queue->bufferDataPackets, queue->bufferDataPackets - queue->receivedDataPackets);
+
             // Stage the complete FEC block for use once reassembly is complete
             stageCompleteFecBlock(queue);
 

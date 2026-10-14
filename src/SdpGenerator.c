@@ -333,6 +333,17 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
     snprintf(payloadStr, sizeof(payloadStr), "%d", StreamConfig.packetSize);
     err |= addAttributeString(&optionHead, "x-nv-video[0].packetSize", payloadStr);
 
+    if (VideoFecControlSupported) {
+        // -2 is the host's own setting, -1 automatic, 0-100 a fixed percentage
+        int fecPercentage = StreamConfig.videoFecMode == LI_FEC_AUTOMATIC ? -1 :
+                            StreamConfig.videoFecMode == LI_FEC_FIXED ? StreamConfig.videoFecPercentage :
+                            -2;
+        snprintf(payloadStr, sizeof(payloadStr), "%d", fecPercentage);
+        err |= addAttributeString(&optionHead, "x-ml-video.fecPercentage", payloadStr);
+        err |= addAttributeString(&optionHead, "x-ml-video.fecSummaryVersion", "1");
+        Limelog("Requesting dynamic FEC: %d\n", fecPercentage);
+    }
+
     err |= addAttributeString(&optionHead, "x-nv-video[0].rateControlMode", "4");
 
     err |= addAttributeString(&optionHead, "x-nv-video[0].timeoutLengthMs", "7000");

@@ -1216,6 +1216,17 @@ int performRtspHandshake(PSERVER_INFORMATION serverInfo) {
             Limelog("Reference frame invalidation is not supported by this host\n");
         }
 
+        // Dynamic FEC needs a host that takes our loss summaries on the encrypted control stream
+        if (StreamConfig.videoFecMode != LI_FEC_DISABLED && IS_SUNSHINE() && APP_VERSION_AT_LEAST(7, 1, 431)) {
+            uint32_t fecControlVersion;
+            VideoFecControlSupported =
+                parseSdpAttributeToUInt(response.payload, "x-ss-video[0].fecControlVersion", &fecControlVersion) &&
+                fecControlVersion == 1;
+            if (!VideoFecControlSupported) {
+                Limelog("Dynamic FEC is not supported by this host\n");
+            }
+        }
+
         // Look for the Sunshine feature flags in the SDP attributes
         if (!parseSdpAttributeToUInt(response.payload, "x-ss-general.featureFlags", &SunshineFeatureFlags)) {
             SunshineFeatureFlags = 0;

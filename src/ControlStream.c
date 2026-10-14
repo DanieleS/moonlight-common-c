@@ -96,6 +96,15 @@ static ENetPeer* peer;
 static PLT_MUTEX enetMutex;
 static bool usePeriodicPing;
 
+// Dynamic FEC loss summary for the current period, filled by the video receive thread
+#define FEC_SUMMARY_INTERVAL_MS 1000
+#define FEC_SUMMARY_MAX_DATA_PACKETS 1000000
+static PLT_MUTEX fecSummaryMutex;
+static uint32_t fecSummaryDataPackets;
+static uint32_t fecSummaryMissingPackets;
+static uint32_t fecSummarySequence;
+static uint64_t fecSummaryLastSentMs;
+
 static PLT_THREAD lossStatsThread;
 static PLT_THREAD invalidateRefFramesThread;
 static PLT_THREAD requestIdrFrameThread;
@@ -340,6 +349,9 @@ int initializeControlStream(void) {
     LbqInitializeLinkedBlockingQueue(&frameFecStatusQueue, 8); // Limits number of frame status reports per periodic ping interval
     LbqInitializeLinkedBlockingQueue(&asyncCallbackQueue, 30);
     PltCreateMutex(&enetMutex);
+    PltCreateMutex(&fecSummaryMutex);
+    fecSummaryDataPackets = fecSummaryMissingPackets = fecSummarySequence = 0;
+    fecSummaryLastSentMs = PltGetMillis();
 
     encryptedControlStream = APP_VERSION_AT_LEAST(7, 1, 431);
 
@@ -417,6 +429,7 @@ void destroyControlStream(void) {
     freeBasicLbqList(LbqDestroyLinkedBlockingQueue(&frameFecStatusQueue));
     freeBasicLbqList(LbqDestroyLinkedBlockingQueue(&asyncCallbackQueue));
 
+    PltDeleteMutex(&fecSummaryMutex);
     PltDeleteMutex(&enetMutex);
 }
 
@@ -487,6 +500,21 @@ void connectionReceivedCompleteFrame(uint32_t frameIndex, bool frameIsLTR) {
             }
         }
     }
+}
+
+// Count data shards and how many of them were lost, for the dynamic FEC summary.
+// The RTP queue calls this once per FEC block, and once per run of lost blocks.
+void connectionRecordVideoLoss(uint32_t dataPackets, uint32_t missingDataPackets) {
+    if (!VideoFecControlSupported || dataPackets == 0 || missingDataPackets > dataPackets) {
+        return;
+    }
+
+    PltLockMutex(&fecSummaryMutex);
+    if (dataPackets <= FEC_SUMMARY_MAX_DATA_PACKETS - fecSummaryDataPackets) {
+        fecSummaryDataPackets += dataPackets;
+        fecSummaryMissingPackets += missingDataPackets;
+    }
+    PltUnlockMutex(&fecSummaryMutex);
 }
 
 void connectionSendFrameFecStatus(PSS_FRAME_FEC_STATUS fecStatus) {
@@ -1484,6 +1512,32 @@ static void controlReceiveThreadFunc(void* context) {
     }
 }
 
+// Send the period's loss summary once a second. Returns false if the send failed.
+static bool sendFecSummaryIfDue(void) {
+    SS_FEC_SUMMARY summary;
+    uint64_t now = PltGetMillis();
+
+    if (!VideoFecControlSupported || now - fecSummaryLastSentMs < FEC_SUMMARY_INTERVAL_MS) {
+        return true;
+    }
+    fecSummaryLastSentMs = now;
+
+    // The sequence advances for empty periods too, so the host sees them as a gap.
+    PltLockMutex(&fecSummaryMutex);
+    summary.sequence = BE32(++fecSummarySequence);
+    summary.dataPackets = BE32(fecSummaryDataPackets);
+    summary.missingDataPackets = BE32(fecSummaryMissingPackets);
+    fecSummaryDataPackets = fecSummaryMissingPackets = 0;
+    PltUnlockMutex(&fecSummaryMutex);
+
+    if (summary.dataPackets == 0) {
+        return true;
+    }
+
+    // Unreliable: a lost summary is a gap the host already handles
+    return sendMessageEnet(SS_FEC_SUMMARY_PTYPE, sizeof(summary), &summary, CTRL_CHANNEL_GENERIC, 0, false);
+}
+
 static void lossStatsThreadFunc(void* context) {
     BYTE_BUFFER byteBuffer;
 
@@ -1495,6 +1549,12 @@ static void lossStatsThreadFunc(void* context) {
         BbPut32(&byteBuffer, 0); // Timestamp?
 
         while (!PltIsThreadInterrupted(&lossStatsThread)) {
+            if (!sendFecSummaryIfDue()) {
+                Limelog("Loss Stats: Sending FEC summary failed: %d\n", (int)LastSocketError());
+                ListenerCallbacks.connectionTerminated(LastSocketFail());
+                return;
+            }
+
             // For Sunshine servers, send the more detailed per-frame FEC messages
             if (IS_SUNSHINE()) {
                 PQUEUED_FRAME_FEC_STATUS queuedFrameStatus;

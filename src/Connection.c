@@ -25,6 +25,7 @@ OPUS_MULTISTREAM_CONFIGURATION HighQualityOpusConfig;
 int AudioPacketDuration;
 bool AudioEncryptionEnabled;
 bool ReferenceFrameInvalidationSupported;
+bool VideoFecControlSupported;
 uint16_t RtspPortNumber;
 uint16_t ControlPortNumber;
 uint16_t AudioPortNumber;
@@ -260,8 +261,17 @@ int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION stre
 
     memset(&LocalAddr, 0, sizeof(LocalAddr));
     NegotiatedVideoFormat = 0;
+    VideoFecControlSupported = false;
     memcpy(&StreamConfig, streamConfig, sizeof(StreamConfig));
     RemoteAddrString = strdup(serverInfo->address);
+
+    if (StreamConfig.videoFecMode < LI_FEC_DISABLED || StreamConfig.videoFecMode > LI_FEC_FIXED ||
+            (StreamConfig.videoFecMode == LI_FEC_FIXED &&
+             (StreamConfig.videoFecPercentage < 0 || StreamConfig.videoFecPercentage > 100))) {
+        Limelog("Ignoring invalid video FEC preference (mode %d, %d%%)\n",
+                StreamConfig.videoFecMode, StreamConfig.videoFecPercentage);
+        StreamConfig.videoFecMode = LI_FEC_DISABLED;
+    }
 
     // The values in RTSP SETUP will be used to populate these.
     VideoPortNumber = 0;
