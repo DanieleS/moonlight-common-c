@@ -768,7 +768,6 @@ static bool sendMessageEnet(short ptype, short paylen, const void* payload, uint
     if (encryptedControlStream) {
         PNVCTL_ENCRYPTED_PACKET_HEADER encPacket;
         PNVCTL_ENET_PACKET_HEADER_V2 packet;
-        char tempBuffer[256];
 
         enetPacket = enet_packet_create(NULL,
                                         sizeof(*encPacket) + AES_GCM_TAG_LENGTH + sizeof(*packet) + paylen,
@@ -786,14 +785,14 @@ static bool sendMessageEnet(short ptype, short paylen, const void* payload, uint
         encPacket->length = sizeof(encPacket->seq) + AES_GCM_TAG_LENGTH + sizeof(*packet) + paylen;
         encPacket->seq = currentEnetSequenceNumber++;
 
-        // Construct the plaintext data for encryption
-        LC_ASSERT(sizeof(*packet) + paylen < sizeof(tempBuffer));
-        packet = (PNVCTL_ENET_PACKET_HEADER_V2)tempBuffer;
+        // Construct the plaintext data directly in the final packet, after the
+        // encrypted header and GCM tag, and encrypt it in place.
+        packet = (PNVCTL_ENET_PACKET_HEADER_V2)(((unsigned char*)(encPacket + 1)) + AES_GCM_TAG_LENGTH);
         packet->type = ptype;
         packet->payloadLength = paylen;
         memcpy(&packet[1], payload, paylen);
 
-        // Encrypt the data into the final packet (and byteswap for BE machines)
+        // Encrypt the data in place (and byteswap for BE machines)
         if (!encryptControlMessage(encPacket, packet)) {
             Limelog("Failed to encrypt control stream message\n");
             enet_packet_destroy(enetPacket);
