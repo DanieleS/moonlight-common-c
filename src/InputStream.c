@@ -552,53 +552,81 @@ static void inputSendThreadProc(void* context) {
             // HACK: This is a workaround for the fact that GFE doesn't appear to synchronize keyboard
             // and UTF-8 text events with each other. We need to make sure any previous keyboard events
             // have been processed prior to sending these UTF-8 events to avoid interference between
-            // the two (especially with modifier keys).
-            flushInputOnControlStream();
-            while (!PltIsThreadInterrupted(&inputSendThread) && isControlDataInTransit()) {
-                PltSleepMs(10);
+            // the two (especially with modifier keys). Sunshine handles both in order, so it can skip this.
+            if (!IS_SUNSHINE()) {
+                flushInputOnControlStream();
+                while (!PltIsThreadInterrupted(&inputSendThread) && isControlDataInTransit()) {
+                    PltSleepMs(10);
+                }
+
+                // Finally, sleep an additional 50 ms to allow the events to be processed by Windows
+                PltSleepMs(50);
             }
 
-            // Finally, sleep an additional 50 ms to allow the events to be processed by Windows
-            PltSleepMs(50);
-
-            // We send each Unicode code point individually. This way we can always ensure they will
-            // never straddle a packet boundary (which will cause a parsing error on the host).
+            // GFE gets one Unicode code point per packet. Sunshine accepts several whole code points
+            // per packet, so we pack as many as fit. Either way a code point never straddles a packet
+            // boundary (which would cause a parsing error on the host).
             while (i < totalLength && !PltIsThreadInterrupted(&inputSendThread)) {
-                uint32_t codePointLength;
-                uint8_t firstByte = (uint8_t)holder->packet.unicode.text[i];
-                if ((firstByte & 0x80) == 0x00) {
-                    // 1 byte code point
-                    codePointLength = 1;
+                uint32_t chunkLength = 0;
+                bool invalid = false;
+
+                while (i + chunkLength < totalLength) {
+                    uint32_t codePointLength;
+                    uint8_t firstByte = (uint8_t)holder->packet.unicode.text[i + chunkLength];
+                    if ((firstByte & 0x80) == 0x00) {
+                        // 1 byte code point
+                        codePointLength = 1;
+                    }
+                    else if ((firstByte & 0xE0) == 0xC0) {
+                        // 2 byte code point
+                        codePointLength = 2;
+                    }
+                    else if ((firstByte & 0xF0) == 0xE0) {
+                        // 3 byte code point
+                        codePointLength = 3;
+                    }
+                    else if ((firstByte & 0xF8) == 0xF0) {
+                        // 4 byte code point
+                        codePointLength = 4;
+                    }
+                    else {
+                        Limelog("Invalid unicode code point starting byte: %02x\n", firstByte);
+                        invalid = true;
+                        break;
+                    }
+
+                    // Stop if the code point is truncated or doesn't fit in this packet
+                    if (i + chunkLength + codePointLength > totalLength ||
+                            chunkLength + codePointLength > UTF8_TEXT_EVENT_MAX_COUNT) {
+                        break;
+                    }
+
+                    chunkLength += codePointLength;
+
+                    if (!IS_SUNSHINE()) {
+                        break;
+                    }
                 }
-                else if ((firstByte & 0xE0) == 0xC0) {
-                    // 2 byte code point
-                    codePointLength = 2;
-                }
-                else if ((firstByte & 0xF0) == 0xE0) {
-                    // 3 byte code point
-                    codePointLength = 3;
-                }
-                else if ((firstByte & 0xF8) == 0xF0) {
-                    // 4 byte code point
-                    codePointLength = 4;
-                }
-                else {
-                    Limelog("Invalid unicode code point starting byte: %02x\n", firstByte);
+
+                if (chunkLength == 0) {
                     break;
                 }
 
-                // Use the original packet as a template and fixup to send one code point at a time
+                // Use the original packet as a template and fixup to send one chunk at a time
                 splitPacket = *holder;
-                splitPacket.packet.unicode.header.size = BE32(sizeof(uint32_t) + codePointLength);
-                memcpy(splitPacket.packet.unicode.text, &holder->packet.unicode.text[i], codePointLength);
+                splitPacket.packet.unicode.header.size = BE32(sizeof(uint32_t) + chunkLength);
+                memcpy(splitPacket.packet.unicode.text, &holder->packet.unicode.text[i], chunkLength);
 
                 // Encrypt and send the split packet
-                if (!sendInputPacket(&splitPacket, i + 1 < totalLength)) {
+                if (!sendInputPacket(&splitPacket, i + chunkLength < totalLength)) {
                     freePacketHolder(holder);
                     return;
                 }
 
-                i += codePointLength;
+                i += chunkLength;
+                if (invalid) {
+                    break;
+                }
             }
 
             freePacketHolder(holder);
