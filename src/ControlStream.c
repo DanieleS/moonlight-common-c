@@ -2280,6 +2280,24 @@ int LiSendExecServerCmd(uint8_t cmdId) {
     );
 }
 
+int LiSendCaptureAction(uint8_t action) {
+    uint8_t payload[4] = {SS_CAPTURE_ACTION_WIRE_VERSION, action, 0, 0};
+
+    // Only a host that advertised the extension knows the message type
+    if (!(SunshineFeatureFlags & LI_FF_CAPTURE_ACTIONS)) {
+        return LI_ERR_UNSUPPORTED;
+    }
+
+    return sendMessageAndForget(
+        SS_CAPTURE_ACTION_PTYPE,
+        sizeof(payload),
+        payload,
+        CTRL_CHANNEL_SERVERCTL,
+        ENET_PACKET_FLAG_RELIABLE,
+        false
+    ) ? 0 : -1;
+}
+
 // Send a server cmd request to the streaming machine
 int LiSendEmptyPayload() {
     uint8_t payload[4] = {0xAA, 0x55, 0xAA, 0x55};
