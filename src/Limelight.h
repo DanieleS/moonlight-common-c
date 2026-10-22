@@ -685,6 +685,25 @@ int LiGetControlStreamSilenceMs(void);
 // This function sends a request to the server to execute the requested cmd id.
 int LiSendExecServerCmd(uint8_t cmdId);
 
+// Capture actions for LiSendCaptureAction()
+#define LI_CAPTURE_SCREENSHOT        0x01 // Save a screenshot
+#define LI_CAPTURE_SAVE_REPLAY       0x02 // Save the replay buffer (the last few seconds)
+#define LI_CAPTURE_TOGGLE_RECORDING  0x03 // Start or stop a recording; the host does not say which
+
+// This function asks the host to carry out a capture action with the capture tool configured
+// on the host (Xbox Game Bar, the NVIDIA app, ...), rather than the client pressing that
+// tool's shortcut itself. action is one of LI_CAPTURE_*; a host that does not know an action
+// ignores it.
+//
+// Returns LI_ERR_UNSUPPORTED unless the host advertised LI_FF_CAPTURE_ACTIONS; a client may
+// then fall back to sending the shortcut as keyboard input. When the host advertised
+// LI_FF_CAPTURE_ACTIONS but not LI_FF_CAPTURE_AVAILABLE, captures are turned off on the host
+// and the client should not offer them. Returns 0 on success and -1 if the message could not
+// be sent.
+// This function may only be called between LiStartConnection() and LiStopConnection().
+// This is a Vibepollo protocol extension.
+int LiSendCaptureAction(uint8_t action);
+
 // This function sends an empty payload to the server.
 // This method exists here for workaround client side wifi sleeps.
 int LiSendEmptyPayload();
@@ -1159,6 +1178,8 @@ void LiRequestIdrFrame(void);
 #define LI_FF_PEN_TOUCH_EVENTS        0x01 // LiSendTouchEvent()/LiSendPenEvent() supported
 #define LI_FF_CONTROLLER_TOUCH_EVENTS 0x02 // LiSendControllerTouchEvent() supported
 #define LI_FF_TEXT_FOCUS              0x10000 // Host can report text field focus (ConnListenerSetTextFocus())
+#define LI_FF_CAPTURE_ACTIONS         0x20000 // Host carries out capture actions (LiSendCaptureAction())
+#define LI_FF_CAPTURE_AVAILABLE       0x40000 // Host has a capture tool configured for this session
 uint32_t LiGetHostFeatureFlags(void);
 
 #ifdef __cplusplus

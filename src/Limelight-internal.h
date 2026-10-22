@@ -100,6 +100,15 @@ extern uint32_t EncryptionFeaturesEnabled;
 #define SS_TEXT_FOCUS_PTYPE 0x3020
 #define SS_TEXT_FOCUS_MIN_PAYLOAD_SIZE 8
 
+// Vibepollo extension: client sends SS_CAPTURE_ACTION_PTYPE messages. Next to
+// ML_FF_TEXT_FOCUS for the same reasons; the host's LI_FF_CAPTURE_ACTIONS is the same bit.
+#define ML_FF_CAPTURE_ACTIONS 0x20000
+
+// Vibepollo extension: client -> host capture request, carried out by the host's
+// configured capture tool. The payload is version (u8), action (u8), reserved (u16).
+#define SS_CAPTURE_ACTION_PTYPE 0x3021
+#define SS_CAPTURE_ACTION_WIRE_VERSION 1
+
 #define UDP_RECV_POLL_TIMEOUT_MS 100
 
 // At this value or above, we will request high quality audio unless CAPABILITY_SLOW_OPUS_DECODER
