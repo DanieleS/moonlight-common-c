@@ -159,3 +159,7 @@ uint32_t LiGetHostFeatureFlags(void) {
 bool LiIsDynamicFecNegotiated(void) {
     return VideoFecControlSupported;
 }
+
+bool LiIsClientRoamingNegotiated(void) {
+    return ClientRoamingNegotiated;
+}

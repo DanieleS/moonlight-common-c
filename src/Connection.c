@@ -1,4 +1,5 @@
 #include "Limelight-internal.h"
+#include "ClientRoaming.h"
 
 static int stage = STAGE_NONE;
 static ConnListenerConnectionTerminated originalTerminationCallback;
@@ -26,6 +27,7 @@ int AudioPacketDuration;
 bool AudioEncryptionEnabled;
 bool ReferenceFrameInvalidationSupported;
 bool VideoFecControlSupported;
+bool ClientRoamingNegotiated;
 uint16_t RtspPortNumber;
 uint16_t ControlPortNumber;
 uint16_t AudioPortNumber;
@@ -73,6 +75,9 @@ void LiStopConnection(void) {
 
     // Set the interrupted flag
     LiInterruptConnection();
+
+    // The roaming thread moves sockets of the streams below, so it goes first
+    ClientRoamingStop();
 
     if (stage == STAGE_INPUT_STREAM_START) {
         Limelog("Stopping input stream...");
@@ -262,6 +267,7 @@ int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION stre
     memset(&LocalAddr, 0, sizeof(LocalAddr));
     NegotiatedVideoFormat = 0;
     VideoFecControlSupported = false;
+    ClientRoamingNegotiated = false;
     memcpy(&StreamConfig, streamConfig, sizeof(StreamConfig));
     RemoteAddrString = strdup(serverInfo->address);
 
@@ -460,6 +466,18 @@ int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION stre
     ListenerCallbacks.stageComplete(STAGE_RTSP_HANDSHAKE);
     Limelog("done\n");
 
+    // Client roaming needs the ENet control stream. Arm it now, so a datagram from the
+    // host is never mistaken for ENet traffic.
+    if (ClientRoamingNegotiated) {
+        if (AppVersionQuad[0] < 5) {
+            Limelog("Client roaming needs the ENet control stream, not using it\n");
+            ClientRoamingNegotiated = false;
+        }
+        else {
+            ClientRoamingInit();
+        }
+    }
+
     Limelog("Initializing control stream...");
     ListenerCallbacks.stageStarting(STAGE_CONTROL_STREAM_INIT);
     err = initializeControlStream();
@@ -540,7 +558,12 @@ int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION stre
     LC_ASSERT(stage == STAGE_INPUT_STREAM_START);
     ListenerCallbacks.stageComplete(STAGE_INPUT_STREAM_START);
     Limelog("done\n");
-    
+
+    // Every stream is running, so network changes can be followed from here on
+    if (ClientRoamingNegotiated) {
+        ClientRoamingStart();
+    }
+
     // Wiggle the mouse a bit to wake the display up
     LiSendMouseMoveEvent(1, 1);
     PltSleepMs(10);

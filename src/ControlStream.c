@@ -1,4 +1,5 @@
 #include "Limelight-internal.h"
+#include "ClientRoaming.h"
 
 // This is a private header, but it just contains some time macros
 #include <enet/time.h>
@@ -951,6 +952,20 @@ static bool sendMessageAndDiscardReply(short ptype, short paylen, const void* pa
 // pending receives first. It works around what appears to be a bug in ENet
 // where pending disconnects can cause loss of unprocessed received data.
 static int ignoreDisconnectIntercept(ENetHost* host, ENetEvent* event) {
+    // Client roaming datagrams share the control port with ENet but aren't ENet. They are
+    // consumed here before ENet parses them (read as an ENet header they'd be dropped anyway)
+    // and queued for the roaming thread. Nothing is looked at unless roaming was negotiated.
+    if (ClientRoamingNegotiated && ClientRoamingIsDatagram(host->receivedData, host->receivedDataLength)) {
+        // Only the host's own address may talk to us
+        if (peer != NULL && enet_address_equal(&host->receivedPeerAddress, &peer->address)) {
+            ClientRoamingQueueDatagram(host->receivedData, host->receivedDataLength);
+        }
+        if (event) {
+            event->type = ENET_EVENT_TYPE_NONE;
+        }
+        return 1;
+    }
+
     if (host->receivedDataLength == sizeof(ENetProtocolHeader) + sizeof(ENetProtocolDisconnect)) {
         ENetProtocolHeader* protoHeader = (ENetProtocolHeader*)host->receivedData;
         ENetProtocolDisconnect* disconnect = (ENetProtocolDisconnect*)(protoHeader + 1);
@@ -1852,6 +1867,7 @@ int stopControlStream(void) {
         enet_host_destroy(client);
         client = NULL;
     }
+    ControlStreamReapRetiredSocket(true);
 
     if (ctlSock != INVALID_SOCKET) {
         closeSocket(ctlSock);
@@ -1932,6 +1948,101 @@ int LiGetControlStreamSilenceMs(void) {
     }
 
     return ret;
+}
+
+// Client roaming: the control socket replaced by ControlStreamSwapSocket(). The control
+// receive thread waits on client->socket outside enetMutex, so the old socket stays open
+// for a moment instead of being closed under its feet.
+#define ROAM_RETIRED_SOCKET_LINGER_MS 1500
+#define ROAM_CONTROL_SOCKET_BUFFER_SIZE (256 * 1024)
+static SOCKET retiredEnetSocket = INVALID_SOCKET;
+static uint64_t retiredEnetSocketTimeMs;
+
+// Creates a control socket bound to the given local address (wildcard port) with the
+// options enet_host_create() and startControlStream() give the original one.
+SOCKET ControlStreamCreateRoamSocket(struct sockaddr_storage* localAddr) {
+    SOCKET s;
+    int bufferSize;
+
+    s = bindUdpSocket(RemoteAddr.ss_family, localAddr, AddrLen, 0, SOCK_QOS_TYPE_BEST_EFFORT);
+    if (s == INVALID_SOCKET) {
+        return INVALID_SOCKET;
+    }
+
+    if (setSocketNonBlocking(s, true) != 0) {
+        int err = LastSocketError();
+        closeSocket(s);
+        SetLastSocketError(err);
+        return INVALID_SOCKET;
+    }
+
+    bufferSize = ROAM_CONTROL_SOCKET_BUFFER_SIZE;
+    setsockopt(s, SOL_SOCKET, SO_RCVBUF, (char*)&bufferSize, sizeof(bufferSize));
+    setsockopt(s, SOL_SOCKET, SO_SNDBUF, (char*)&bufferSize, sizeof(bufferSize));
+
+    // High priority QoS marking, as for the original control socket
+    enet_socket_set_option(s, ENET_SOCKOPT_QOS, 1);
+
+    return s;
+}
+
+// Makes newSock the ENet host's socket. The peer keeps its address (the host's), so ENet
+// carries on with the same connection from the new local address.
+bool ControlStreamSwapSocket(SOCKET newSock) {
+    bool swapped = false;
+
+    PltLockMutex(&enetMutex);
+    if (client != NULL) {
+        SOCKET stale = retiredEnetSocket;
+
+        // A previous move that was never reaped
+        if (stale != INVALID_SOCKET) {
+            closeSocket(stale);
+        }
+
+        retiredEnetSocket = client->socket;
+        retiredEnetSocketTimeMs = PltGetMillis();
+        client->socket = newSock;
+        swapped = true;
+    }
+    PltUnlockMutex(&enetMutex);
+
+    return swapped;
+}
+
+// Closes the control socket replaced by a move once nothing can still be waiting on it.
+void ControlStreamReapRetiredSocket(bool force) {
+    SOCKET stale = INVALID_SOCKET;
+
+    PltLockMutex(&enetMutex);
+    if (retiredEnetSocket != INVALID_SOCKET &&
+            (force || PltGetMillis() - retiredEnetSocketTimeMs >= ROAM_RETIRED_SOCKET_LINGER_MS)) {
+        stale = retiredEnetSocket;
+        retiredEnetSocket = INVALID_SOCKET;
+    }
+    PltUnlockMutex(&enetMutex);
+
+    if (stale != INVALID_SOCKET) {
+        closeSocket(stale);
+    }
+}
+
+// Sends a roaming datagram to the host's control port from the control socket, so it
+// carries the same source address as the ENet traffic.
+bool ControlStreamSendRoamDatagram(const unsigned char* data, int length) {
+    LC_SOCKADDR remote;
+    bool sent = false;
+
+    memcpy(&remote, &RemoteAddr, sizeof(remote));
+    SET_PORT(&remote, ControlPortNumber);
+
+    PltLockMutex(&enetMutex);
+    if (client != NULL) {
+        sent = sendto(client->socket, (const char*)data, length, 0, (struct sockaddr*)&remote, AddrLen) == length;
+    }
+    PltUnlockMutex(&enetMutex);
+
+    return sent;
 }
 
 // Starts the control stream

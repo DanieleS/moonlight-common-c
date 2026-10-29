@@ -1232,6 +1232,22 @@ int performRtspHandshake(PSERVER_INFORMATION serverInfo) {
             }
         }
 
+        // Client roaming: the host advertises the highest wire version it speaks. We speak
+        // version 1 only, whatever a larger number says. Without the attribute (or with the
+        // setting off) nothing roaming related is ever sent.
+        {
+            uint32_t roamingVersion;
+            if (parseSdpAttributeToUInt(response.payload, "x-rl-roaming", &roamingVersion) && roamingVersion >= 1) {
+                if (StreamConfig.clientRoaming & LI_ROAMING_ENABLED) {
+                    ClientRoamingNegotiated = true;
+                    Limelog("Client roaming: advertised by the host (version %u), enabled\n", roamingVersion);
+                }
+                else {
+                    Limelog("Client roaming: advertised by the host (version %u), disabled in the settings\n", roamingVersion);
+                }
+            }
+        }
+
         // Look for the Sunshine feature flags in the SDP attributes
         if (!parseSdpAttributeToUInt(response.payload, "x-ss-general.featureFlags", &SunshineFeatureFlags)) {
             SunshineFeatureFlags = 0;
