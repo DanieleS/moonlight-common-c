@@ -534,6 +534,183 @@ void PltDestroyCryptoContext(PPLT_CRYPTO_CONTEXT ctx) {
     free(ctx);
 }
 
+// One-shot AES-128 encryption of a single 16-byte block (ECB, no padding).
+// Used for key derivation, so it uses a throwaway context every time.
+bool PltAes128EncryptBlock(const unsigned char key[16], const unsigned char in[16], unsigned char out[16]) {
+#ifdef USE_PSA_CRYPTO
+    psa_key_id_t keyId = PSA_KEY_ID_NULL;
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+    size_t outLen = 0;
+    bool ok = false;
+
+    if (psa_crypto_init() != PSA_SUCCESS) {
+        return false;
+    }
+
+    psa_set_key_type(&attributes, PSA_KEY_TYPE_AES);
+    psa_set_key_bits(&attributes, 128);
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_ENCRYPT);
+    psa_set_key_algorithm(&attributes, PSA_ALG_ECB_NO_PADDING);
+
+    if (psa_import_key(&attributes, key, 16, &keyId) == PSA_SUCCESS) {
+        ok = psa_cipher_encrypt(keyId, PSA_ALG_ECB_NO_PADDING, in, 16, out, 16, &outLen) == PSA_SUCCESS && outLen == 16;
+        psa_destroy_key(keyId);
+    }
+
+    psa_reset_key_attributes(&attributes);
+    return ok;
+#else
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    int len = 0;
+    bool ok = false;
+
+    if (ctx == NULL) {
+        return false;
+    }
+
+    if (EVP_EncryptInit_ex(ctx, EVP_aes_128_ecb(), NULL, key, NULL) == 1 &&
+            EVP_CIPHER_CTX_set_padding(ctx, 0) == 1 &&
+            EVP_EncryptUpdate(ctx, out, &len, in, 16) == 1 &&
+            len == 16) {
+        ok = true;
+    }
+
+    EVP_CIPHER_CTX_free(ctx);
+    return ok;
+#endif
+}
+
+// One-shot AES-128-GCM with additional authenticated data, a 12-byte IV and a
+// detached 16-byte tag. Additive: the context-based helpers above have no AAD.
+// The output buffer must be at least dataLength bytes (in-place is not supported).
+bool PltAes128GcmSealAad(const unsigned char key[16], const unsigned char iv[12],
+                         const unsigned char* aad, int aadLength,
+                         const unsigned char* in, int dataLength,
+                         unsigned char* out, unsigned char tag[16]) {
+#ifdef USE_PSA_CRYPTO
+    psa_key_id_t keyId = PSA_KEY_ID_NULL;
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+    unsigned char* buf;
+    size_t outLen = 0;
+    bool ok = false;
+
+    if (psa_crypto_init() != PSA_SUCCESS) {
+        return false;
+    }
+
+    buf = malloc((size_t)dataLength + 16);
+    if (buf == NULL) {
+        return false;
+    }
+
+    psa_set_key_type(&attributes, PSA_KEY_TYPE_AES);
+    psa_set_key_bits(&attributes, 128);
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_ENCRYPT);
+    psa_set_key_algorithm(&attributes, PSA_ALG_GCM);
+
+    if (psa_import_key(&attributes, key, 16, &keyId) == PSA_SUCCESS) {
+        if (psa_aead_encrypt(keyId, PSA_ALG_GCM, iv, 12, aad, (size_t)aadLength,
+                             in, (size_t)dataLength, buf, (size_t)dataLength + 16, &outLen) == PSA_SUCCESS &&
+                outLen == (size_t)dataLength + 16) {
+            memcpy(out, buf, dataLength);
+            memcpy(tag, buf + dataLength, 16);
+            ok = true;
+        }
+        psa_destroy_key(keyId);
+    }
+
+    psa_reset_key_attributes(&attributes);
+    free(buf);
+    return ok;
+#else
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    int len = 0;
+    bool ok = false;
+
+    if (ctx == NULL) {
+        return false;
+    }
+
+    if (EVP_EncryptInit_ex(ctx, EVP_aes_128_gcm(), NULL, NULL, NULL) == 1 &&
+            EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, NULL) == 1 &&
+            EVP_EncryptInit_ex(ctx, NULL, NULL, key, iv) == 1 &&
+            EVP_EncryptUpdate(ctx, NULL, &len, aad, aadLength) == 1 &&
+            EVP_EncryptUpdate(ctx, out, &len, in, dataLength) == 1 &&
+            EVP_EncryptFinal_ex(ctx, out + len, &len) == 1 &&
+            EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, 16, tag) == 1) {
+        ok = true;
+    }
+
+    EVP_CIPHER_CTX_free(ctx);
+    return ok;
+#endif
+}
+
+// Counterpart of PltAes128GcmSealAad(). Returns false when the tag does not verify.
+bool PltAes128GcmOpenAad(const unsigned char key[16], const unsigned char iv[12],
+                         const unsigned char* aad, int aadLength,
+                         const unsigned char* in, int dataLength,
+                         const unsigned char tag[16], unsigned char* out) {
+#ifdef USE_PSA_CRYPTO
+    psa_key_id_t keyId = PSA_KEY_ID_NULL;
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+    unsigned char* buf;
+    size_t outLen = 0;
+    bool ok = false;
+
+    if (psa_crypto_init() != PSA_SUCCESS) {
+        return false;
+    }
+
+    // PSA wants ciphertext followed by the tag
+    buf = malloc((size_t)dataLength + 16);
+    if (buf == NULL) {
+        return false;
+    }
+    memcpy(buf, in, dataLength);
+    memcpy(buf + dataLength, tag, 16);
+
+    psa_set_key_type(&attributes, PSA_KEY_TYPE_AES);
+    psa_set_key_bits(&attributes, 128);
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_DECRYPT);
+    psa_set_key_algorithm(&attributes, PSA_ALG_GCM);
+
+    if (psa_import_key(&attributes, key, 16, &keyId) == PSA_SUCCESS) {
+        if (psa_aead_decrypt(keyId, PSA_ALG_GCM, iv, 12, aad, (size_t)aadLength,
+                             buf, (size_t)dataLength + 16, out, (size_t)dataLength, &outLen) == PSA_SUCCESS &&
+                outLen == (size_t)dataLength) {
+            ok = true;
+        }
+        psa_destroy_key(keyId);
+    }
+
+    psa_reset_key_attributes(&attributes);
+    free(buf);
+    return ok;
+#else
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    int len = 0;
+    bool ok = false;
+
+    if (ctx == NULL) {
+        return false;
+    }
+
+    if (EVP_DecryptInit_ex(ctx, EVP_aes_128_gcm(), NULL, NULL, NULL) == 1 &&
+            EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, NULL) == 1 &&
+            EVP_DecryptInit_ex(ctx, NULL, NULL, key, iv) == 1 &&
+            EVP_DecryptUpdate(ctx, NULL, &len, aad, aadLength) == 1 &&
+            EVP_DecryptUpdate(ctx, out, &len, in, dataLength) == 1 &&
+            EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, 16, (void*)tag) == 1 &&
+            EVP_DecryptFinal_ex(ctx, out + len, &len) == 1) {
+        ok = true;
+    }
+
+    EVP_CIPHER_CTX_free(ctx);
+    return ok;
+#endif
+}
+
 void PltGenerateRandomData(unsigned char* data, int length) {
 #ifdef USE_PSA_CRYPTO
     if (psa_crypto_init() != PSA_SUCCESS) {

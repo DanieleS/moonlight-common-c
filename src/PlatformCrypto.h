@@ -52,4 +52,17 @@ bool PltDecryptMessage(PPLT_CRYPTO_CONTEXT ctx, int algorithm, int flags,
                        unsigned char* inputData, int inputDataLength,
                        unsigned char* outputData, int* outputDataLength);
 
+// One-shot helpers used by client roaming (fresh context per call, no state)
+bool PltAes128EncryptBlock(const unsigned char key[16], const unsigned char in[16], unsigned char out[16]);
+
+bool PltAes128GcmSealAad(const unsigned char key[16], const unsigned char iv[12],
+                         const unsigned char* aad, int aadLength,
+                         const unsigned char* in, int dataLength,
+                         unsigned char* out, unsigned char tag[16]);
+
+bool PltAes128GcmOpenAad(const unsigned char key[16], const unsigned char iv[12],
+                         const unsigned char* aad, int aadLength,
+                         const unsigned char* in, int dataLength,
+                         const unsigned char tag[16], unsigned char* out);
+
 void PltGenerateRandomData(unsigned char* data, int length);

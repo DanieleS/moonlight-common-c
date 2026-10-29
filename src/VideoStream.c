@@ -1,4 +1,5 @@
 #include "Limelight-internal.h"
+#include "ClientRoaming.h"
 
 #define FIRST_FRAME_MAX 1500
 #define FIRST_FRAME_TIMEOUT_SEC 10
@@ -9,6 +10,11 @@ static RTP_VIDEO_QUEUE rtpQueue;
 
 static SOCKET rtpSocket = INVALID_SOCKET;
 static SOCKET firstFrameSocket = INVALID_SOCKET;
+
+// Client roaming: the socket replaced by VideoStreamRebind(). The receive thread closes it once
+// it has switched to the new one, because it may still be blocked in a receive on the old one.
+static SOCKET retiredRtpSocket = INVALID_SOCKET;
+static volatile uint32_t videoPingCount;
 
 static PPLT_CRYPTO_CONTEXT decryptionCtx;
 
@@ -46,6 +52,8 @@ void initializeVideoStream(void) {
     receivedDataFromPeer = false;
     firstDataTimeMs = 0;
     receivedFullFrame = false;
+    retiredRtpSocket = INVALID_SOCKET;
+    videoPingCount = 0;
 }
 
 // Clean up the video stream
@@ -69,13 +77,14 @@ static void VideoPingThreadProc(void* context) {
     // on the read-side in ReceiveThreadProc(). This avoids potential
     // issues related to receiving ICMP port unreachable messages due
     // to sending a packet prior to the host PC binding to that port.
-    int pingCount = 0;
     while (!PltIsThreadInterrupted(&udpPingThread)) {
         if (VideoPingPayload.payload[0] != 0) {
-            pingCount++;
-            VideoPingPayload.sequenceNumber = BE32(pingCount);
+            // Ping on a copy: the roaming code can send a ping from another thread
+            SS_PING ping = VideoPingPayload;
 
-            sendto(rtpSocket, (char*)&VideoPingPayload, sizeof(VideoPingPayload), 0, (struct sockaddr*)&saddr, AddrLen);
+            ping.sequenceNumber = BE32(++videoPingCount);
+
+            sendto(rtpSocket, (char*)&ping, sizeof(ping), 0, (struct sockaddr*)&saddr, AddrLen);
         }
         else {
             sendto(rtpSocket, legacyPingData, sizeof(legacyPingData), 0, (struct sockaddr*)&saddr, AddrLen);
@@ -83,6 +92,91 @@ static void VideoPingThreadProc(void* context) {
 
         PltSleepMsInterruptible(&udpPingThread, 500);
     }
+}
+
+static int videoRequestedBufferSize(void) {
+    return ((NegotiatedVideoFormat & VIDEO_FORMAT_MASK_PYROWAVE) ?
+                RTP_RECV_PACKETS_BUFFERED_PYROWAVE : RTP_RECV_PACKETS_BUFFERED) *
+           (StreamConfig.packetSize + MAX_RTP_HEADER_SIZE);
+}
+
+// Client roaming: creates a video socket bound to the given local address with the
+// same options as the original one. The caller publishes it with VideoStreamRebind().
+SOCKET VideoStreamCreateSocket(struct sockaddr_storage* localAddr) {
+    return bindUdpSocket(RemoteAddr.ss_family, localAddr, AddrLen,
+                         videoRequestedBufferSize(), SOCK_QOS_TYPE_VIDEO);
+}
+
+// Client roaming: makes newSock the video socket. The receive and ping threads read
+// rtpSocket on every use. The old socket is closed by the receive thread once it has
+// switched over, because it may still be blocked in a receive on it.
+void VideoStreamRebind(SOCKET newSock) {
+    SOCKET stale = retiredRtpSocket;
+
+    // A previous move that the receive thread never picked up (it wasn't running)
+    retiredRtpSocket = INVALID_SOCKET;
+    if (stale != INVALID_SOCKET) {
+        closeSocket(stale);
+    }
+
+    retiredRtpSocket = rtpSocket;
+    rtpSocket = newSock;
+}
+
+// Client roaming: sends one ping now, on the current socket, so the host learns the new path.
+void VideoStreamPingNow(void) {
+    LC_SOCKADDR saddr;
+
+    if (rtpSocket == INVALID_SOCKET || VideoPortNumber == 0) {
+        return;
+    }
+
+    memcpy(&saddr, &RemoteAddr, sizeof(saddr));
+    SET_PORT(&saddr, VideoPortNumber);
+
+    if (VideoPingPayload.payload[0] != 0) {
+        SS_PING ping = VideoPingPayload;
+
+        ping.sequenceNumber = BE32(++videoPingCount);
+        sendto(rtpSocket, (char*)&ping, sizeof(ping), 0, (struct sockaddr*)&saddr, AddrLen);
+    }
+    else {
+        char legacyPingData[] = { 0x50, 0x49, 0x4E, 0x47 };
+        sendto(rtpSocket, legacyPingData, sizeof(legacyPingData), 0, (struct sockaddr*)&saddr, AddrLen);
+    }
+}
+
+// Picks the receive mode for a video socket (also used after a client roaming rebind)
+static void configureVideoReceiveSocket(SOCKET sock, bool* usePartialFrameTimeout, bool* useSelect) {
+    *usePartialFrameTimeout = (NegotiatedVideoFormat & VIDEO_FORMAT_MASK_PYROWAVE) != 0 &&
+                              setSocketNonBlocking(sock, true) == 0;
+    if (*usePartialFrameTimeout) {
+        *useSelect = false; // The nonblocking helper polls only after draining a burst.
+    }
+    else if (setNonFatalRecvTimeoutMs(sock, UDP_RECV_POLL_TIMEOUT_MS) < 0) {
+        // SO_RCVTIMEO failed, so use select() to wait
+        *useSelect = true;
+    }
+    else {
+        // SO_RCVTIMEO timeout set for recv()
+        *useSelect = false;
+    }
+}
+
+// A receive failure right around a roaming move is expected: the old socket belonged
+// to the network that went away. Give the move up to a second to publish a new socket
+// before the failure ends the stream.
+static bool waitForVideoSocketRebind(SOCKET failedSocket) {
+    int waitedMs;
+
+    for (waitedMs = 0; waitedMs < 1000 && !PltIsThreadInterrupted(&receiveThread); waitedMs += 10) {
+        if (rtpSocket != failedSocket) {
+            return true;
+        }
+        PltSleepMs(10);
+    }
+
+    return rtpSocket != failedSocket;
 }
 
 // Receive thread proc
@@ -96,27 +190,17 @@ static void VideoReceiveThreadProc(void* context) {
     int waitingForVideoMs;
     bool encrypted;
     bool usePartialFrameTimeout;
+    SOCKET curSocket;
 
-    encrypted = !!(EncryptionFeaturesEnabled & SS_ENC_VIDEO);
+    encrypted =!!(EncryptionFeaturesEnabled & SS_ENC_VIDEO);
     decryptedSize = StreamConfig.packetSize + MAX_RTP_HEADER_SIZE;
     minSize = sizeof(RTP_PACKET) + ((EncryptionFeaturesEnabled & SS_ENC_VIDEO) ? sizeof(ENC_VIDEO_HEADER) : 0);
     receiveSize = decryptedSize + ((EncryptionFeaturesEnabled & SS_ENC_VIDEO) ? sizeof(ENC_VIDEO_HEADER) : 0);
     bufferSize = decryptedSize + sizeof(RTPV_QUEUE_ENTRY);
     buffer = NULL;
 
-    usePartialFrameTimeout = (NegotiatedVideoFormat & VIDEO_FORMAT_MASK_PYROWAVE) != 0 &&
-                            setSocketNonBlocking(rtpSocket, true) == 0;
-    if (usePartialFrameTimeout) {
-        useSelect = false; // The nonblocking helper polls only after draining a burst.
-    }
-    else if (setNonFatalRecvTimeoutMs(rtpSocket, UDP_RECV_POLL_TIMEOUT_MS) < 0) {
-        // SO_RCVTIMEO failed, so use select() to wait
-        useSelect = true;
-    }
-    else {
-        // SO_RCVTIMEO timeout set for recv()
-        useSelect = false;
-    }
+    curSocket = rtpSocket;
+    configureVideoReceiveSocket(curSocket, &usePartialFrameTimeout, &useSelect);
 
     // Allocate a staging buffer to use for each received packet
     if (encrypted) {
@@ -134,6 +218,19 @@ static void VideoReceiveThreadProc(void* context) {
     waitingForVideoMs = 0;
     while (!PltIsThreadInterrupted(&receiveThread)) {
         PRTP_PACKET packet;
+
+        // Client roaming may have replaced the socket
+        if (rtpSocket != curSocket) {
+            curSocket = rtpSocket;
+            configureVideoReceiveSocket(curSocket, &usePartialFrameTimeout, &useSelect);
+
+            // We are out of the receive on the old socket, so it can go now
+            if (retiredRtpSocket != INVALID_SOCKET) {
+                SOCKET retired = retiredRtpSocket;
+                retiredRtpSocket = INVALID_SOCKET;
+                closeSocket(retired);
+            }
+        }
 
         if (buffer == NULL) {
             buffer = (char*)malloc(bufferSize);
@@ -163,15 +260,19 @@ static void VideoReceiveThreadProc(void* context) {
                     timeoutMs = UDP_RECV_POLL_TIMEOUT_MS;
                 }
             }
-            err = recvUdpSocketWithTimeout(rtpSocket,
+            err = recvUdpSocketWithTimeout(curSocket,
                                           encrypted ? encryptedBuffer : buffer,
                                           receiveSize, timeoutMs);
         }
         else {
-            err = recvUdpSocket(rtpSocket,
+            err = recvUdpSocket(curSocket,
                                 encrypted ? encryptedBuffer : buffer,
                                 receiveSize,
                                 useSelect);
+        }
+        if (err < 0 && ClientRoamingNegotiated && waitForVideoSocketRebind(curSocket)) {
+            // The socket was replaced while we were receiving on the old one
+            continue;
         }
         if (err < 0) {
             Limelog("Video Receive: recvUdpSocket() failed: %d\n", (int)LastSocketError());
@@ -347,6 +448,10 @@ void stopVideoStream(void) {
         closeSocket(rtpSocket);
         rtpSocket = INVALID_SOCKET;
     }
+    if (retiredRtpSocket != INVALID_SOCKET) {
+        closeSocket(retiredRtpSocket);
+        retiredRtpSocket = INVALID_SOCKET;
+    }
 
     VideoCallbacks.cleanup();
 }
@@ -366,9 +471,7 @@ int startVideoStream(void* rendererContext, int drFlags) {
         return err;
     }
 
-    int requestedBufferSize = ((NegotiatedVideoFormat & VIDEO_FORMAT_MASK_PYROWAVE) ?
-                                   RTP_RECV_PACKETS_BUFFERED_PYROWAVE : RTP_RECV_PACKETS_BUFFERED) *
-                              (StreamConfig.packetSize + MAX_RTP_HEADER_SIZE);
+    int requestedBufferSize = videoRequestedBufferSize();
     rtpSocket = bindUdpSocket(RemoteAddr.ss_family, &LocalAddr, AddrLen,
                               requestedBufferSize, SOCK_QOS_TYPE_VIDEO);
     if (rtpSocket == INVALID_SOCKET) {

@@ -143,7 +143,16 @@ typedef struct _STREAM_CONFIGURATION {
 
     // The FEC percentage (0-100) to ask for with LI_FEC_FIXED. Ignored otherwise.
     int videoFecPercentage;
+
+    // Client roaming: follow a change of the client's network without reconnecting.
+    // 0 = off, otherwise a mix of the LI_ROAMING_* flags below. It only takes effect
+    // when the host advertises roaming in its RTSP DESCRIBE response (a=x-rl-roaming);
+    // with any other host nothing is sent and nothing changes.
+    int clientRoaming;
 } STREAM_CONFIGURATION, *PSTREAM_CONFIGURATION;
+
+#define LI_ROAMING_ENABLED       0x01 // Follow network changes (only if the host advertises roaming)
+#define LI_ROAMING_ALLOW_METERED 0x02 // Also continue on a metered network (mobile data)
 
 // Use this function to zero the stream configuration when allocated on the stack or heap
 void LiInitializeStreamConfiguration(PSTREAM_CONFIGURATION streamConfig);
@@ -1166,6 +1175,24 @@ const char* LiGetHostPyroWaveBitstreamId(void);
 // LI_FEC_HOST_DEFAULT the host takes video parity out of the video budget instead of
 // out of the configured bitrate. Valid after the RTSP handshake.
 bool LiIsDynamicFecNegotiated(void);
+
+// Returns true when client roaming was negotiated: the host advertised a=x-rl-roaming
+// and LI_ROAMING_ENABLED is set in the stream configuration. Valid after the RTSP handshake.
+bool LiIsClientRoamingNegotiated(void);
+
+// Tells the library that the device's default network changed. Metered is true when the new
+// network is metered (mobile data). Thread-safe and cheap, and does nothing unless roaming
+// was negotiated. The library looks up the local address toward the host itself: if it is
+// unchanged (a VPN, another network with the same address) nothing happens.
+void LiNotifyNetworkChanged(bool metered);
+
+#define LI_ROAMING_IDLE    0
+#define LI_ROAMING_MOVING  1 // A move to a new network is in progress
+#define LI_ROAMING_HELD    2 // The network is metered and LI_ROAMING_ALLOW_METERED is off
+int LiGetClientRoamingStatus(void);
+
+// Number of successful moves in this connection.
+uint32_t LiGetClientRoamingCount(void);
 
 // This function requests an IDR frame from the host. Typically this is done using DR_NEED_IDR, but clients
 // processing frames asynchronously may need to reset their decoder state even after returning DR_OK for

@@ -1,6 +1,12 @@
 #include "Limelight-internal.h"
+#include "ClientRoaming.h"
 
 static SOCKET rtpSocket = INVALID_SOCKET;
+
+// Client roaming: the socket replaced by AudioStreamRebind(). The receive thread closes it once
+// it has switched to the new one, because it may still be blocked in a receive on the old one.
+static SOCKET retiredRtpSocket = INVALID_SOCKET;
+static volatile uint32_t audioPingCount;
 
 static LINKED_BLOCKING_QUEUE packetQueue;
 static RTP_AUDIO_QUEUE rtpAudioQueue;
@@ -48,19 +54,65 @@ static void AudioPingThreadProc(void* context) {
     // on the read-side in ReceiveThreadProc(). This avoids potential
     // issues related to receiving ICMP port unreachable messages due
     // to sending a packet prior to the host PC binding to that port.
-    int pingCount = 0;
     while (!PltIsThreadInterrupted(&udpPingThread)) {
         if (AudioPingPayload.payload[0] != 0) {
-            pingCount++;
-            AudioPingPayload.sequenceNumber = BE32(pingCount);
+            // Ping on a copy: the roaming code can send a ping from another thread
+            SS_PING ping = AudioPingPayload;
 
-            sendto(rtpSocket, (char*)&AudioPingPayload, sizeof(AudioPingPayload), 0, (struct sockaddr*)&saddr, AddrLen);
+            ping.sequenceNumber = BE32(++audioPingCount);
+
+            sendto(rtpSocket, (char*)&ping, sizeof(ping), 0, (struct sockaddr*)&saddr, AddrLen);
         }
         else {
             sendto(rtpSocket, legacyPingData, sizeof(legacyPingData), 0, (struct sockaddr*)&saddr, AddrLen);
         }
 
         PltSleepMsInterruptible(&udpPingThread, 500);
+    }
+}
+
+// Client roaming: creates an audio socket bound to the given local address with the
+// same options as the original one. The caller publishes it with AudioStreamRebind().
+SOCKET AudioStreamCreateSocket(struct sockaddr_storage* localAddr) {
+    return bindUdpSocket(RemoteAddr.ss_family, localAddr, AddrLen, 0, SOCK_QOS_TYPE_AUDIO);
+}
+
+// Client roaming: makes newSock the audio socket. The receive and ping threads read
+// rtpSocket on every use. The old socket is closed by the receive thread once it has
+// switched over, because it may still be blocked in a receive on it.
+void AudioStreamRebind(SOCKET newSock) {
+    SOCKET stale = retiredRtpSocket;
+
+    // A previous move that the receive thread never picked up (it wasn't running)
+    retiredRtpSocket = INVALID_SOCKET;
+    if (stale != INVALID_SOCKET) {
+        closeSocket(stale);
+    }
+
+    retiredRtpSocket = rtpSocket;
+    rtpSocket = newSock;
+}
+
+// Client roaming: sends one ping now, on the current socket, so the host learns the new path.
+void AudioStreamPingNow(void) {
+    LC_SOCKADDR saddr;
+
+    if (rtpSocket == INVALID_SOCKET || AudioPortNumber == 0) {
+        return;
+    }
+
+    memcpy(&saddr, &RemoteAddr, sizeof(saddr));
+    SET_PORT(&saddr, AudioPortNumber);
+
+    if (AudioPingPayload.payload[0] != 0) {
+        SS_PING ping = AudioPingPayload;
+
+        ping.sequenceNumber = BE32(++audioPingCount);
+        sendto(rtpSocket, (char*)&ping, sizeof(ping), 0, (struct sockaddr*)&saddr, AddrLen);
+    }
+    else {
+        char legacyPingData[] = { 0x50, 0x49, 0x4E, 0x47 };
+        sendto(rtpSocket, legacyPingData, sizeof(legacyPingData), 0, (struct sockaddr*)&saddr, AddrLen);
     }
 }
 
@@ -71,6 +123,8 @@ int initializeAudioStream(void) {
     lastSeq = 0;
     receivedDataFromPeer = false;
     pingThreadStarted = false;
+    retiredRtpSocket = INVALID_SOCKET;
+    audioPingCount = 0;
     firstReceiveTime = 0;
     audioDecryptionCtx = PltCreateCryptoContext();
 #ifdef LC_DEBUG
@@ -132,6 +186,10 @@ void destroyAudioStream(void) {
 
         closeSocket(rtpSocket);
         rtpSocket = INVALID_SOCKET;
+    }
+    if (retiredRtpSocket != INVALID_SOCKET) {
+        closeSocket(retiredRtpSocket);
+        retiredRtpSocket = INVALID_SOCKET;
     }
 
     PltDestroyCryptoContext(audioDecryptionCtx);
@@ -236,7 +294,24 @@ static void decodeInputData(PQUEUED_AUDIO_PACKET packet) {
     }
 }
 
+// A receive failure right around a roaming move is expected: the old socket belonged
+// to the network that went away. Give the move up to a second to publish a new socket
+// before the failure ends the stream.
+static bool waitForAudioSocketRebind(SOCKET failedSocket) {
+    int waitedMs;
+
+    for (waitedMs = 0; waitedMs < 1000 && !PltIsThreadInterrupted(&receiveThread); waitedMs += 10) {
+        if (rtpSocket != failedSocket) {
+            return true;
+        }
+        PltSleepMs(10);
+    }
+
+    return rtpSocket != failedSocket;
+}
+
 static void AudioReceiveThreadProc(void* context) {
+    SOCKET curSocket;
     PRTP_PACKET rtp;
     PQUEUED_AUDIO_PACKET packet;
     int queueStatus;
@@ -247,17 +322,24 @@ static void AudioReceiveThreadProc(void* context) {
     packet = NULL;
     packetsToDrop = 500 / AudioPacketDuration;
 
-    if (setNonFatalRecvTimeoutMs(rtpSocket, UDP_RECV_POLL_TIMEOUT_MS) < 0) {
-        // SO_RCVTIMEO failed, so use select() to wait
-        useSelect = true;
-    }
-    else {
-        // SO_RCVTIMEO timeout set for recv()
-        useSelect = false;
-    }
+    curSocket = rtpSocket;
+    useSelect = setNonFatalRecvTimeoutMs(curSocket, UDP_RECV_POLL_TIMEOUT_MS) < 0;
 
     waitingForAudioMs = 0;
     while (!PltIsThreadInterrupted(&receiveThread)) {
+        // Client roaming may have replaced the socket
+        if (rtpSocket != curSocket) {
+            curSocket = rtpSocket;
+            useSelect = setNonFatalRecvTimeoutMs(curSocket, UDP_RECV_POLL_TIMEOUT_MS) < 0;
+
+            // We are out of the receive on the old socket, so it can go now
+            if (retiredRtpSocket != INVALID_SOCKET) {
+                SOCKET retired = retiredRtpSocket;
+                retiredRtpSocket = INVALID_SOCKET;
+                closeSocket(retired);
+            }
+        }
+
         if (packet == NULL) {
             packet = (PQUEUED_AUDIO_PACKET)malloc(sizeof(*packet));
             if (packet == NULL) {
@@ -267,7 +349,11 @@ static void AudioReceiveThreadProc(void* context) {
             }
         }
 
-        packet->header.size = recvUdpSocket(rtpSocket, &packet->data[0], MAX_PACKET_SIZE, useSelect);
+        packet->header.size = recvUdpSocket(curSocket, &packet->data[0], MAX_PACKET_SIZE, useSelect);
+        if (packet->header.size < 0 && ClientRoamingNegotiated && waitForAudioSocketRebind(curSocket)) {
+            // The socket was replaced while we were receiving on the old one
+            continue;
+        }
         if (packet->header.size < 0) {
             Limelog("Audio Receive: recvUdpSocket() failed: %d\n", (int)LastSocketError());
             ListenerCallbacks.connectionTerminated(LastSocketFail());
