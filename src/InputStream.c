@@ -22,6 +22,7 @@ static float absCurrentPosY;
 #define MAX_MOTION_EVENTS 2
 
 static uint8_t currentPenButtonState;
+static uint8_t currentPenToolType;
 
 #define CLAMP(val, min, max) (((val) < (min)) ? (min) : (((val) > (max)) ? (max) : (val)))
 
@@ -52,6 +53,9 @@ typedef struct _PACKET_HOLDER {
     uint32_t enetPacketFlags;
     uint8_t channelId;
 
+    int relMouseDeltaX;
+    int relMouseDeltaY;
+
     // The union must be the last member since we abuse the NV_UNICODE_PACKET
     // text field to store variable length data which gets split before being
     // sent to the host.
@@ -78,19 +82,12 @@ typedef struct _PACKET_HOLDER {
 
 static PLT_MUTEX batchedInputMutex;
 static PPACKET_HOLDER currentQueuedControllerPacket[MAX_GAMEPADS];
+static PPACKET_HOLDER currentQueuedRelativeMousePacket;
+static PPACKET_HOLDER currentQueuedAbsoluteMousePacket;
 static struct {
     float x, y, z;
     bool dirty; // Update ready to send (queued packet holder in packetQueue)
 } currentGamepadSensorState[MAX_GAMEPADS][MAX_MOTION_EVENTS];
-static struct {
-    int deltaX, deltaY;
-    bool dirty; // Update ready to send (queued packet holder in packetQueue)
-} currentRelativeMouseState;
-static struct {
-    int x, y;
-    int width, height;
-    bool dirty; // Update ready to send (queued packet holder in packetQueue)
-} currentAbsoluteMouseState;
 
 // Initializes the input stream
 int initializeInputStream(void) {
@@ -114,13 +111,15 @@ int initializeInputStream(void) {
     batchedScrollDelta = 0;
 
     currentPenButtonState = 0;
+    currentPenToolType = 0;
 
     // Start with the virtual mouse centered
     absCurrentPosX = absCurrentPosY = 0.5f;
 
+    memset(currentQueuedControllerPacket, 0, sizeof(currentQueuedControllerPacket));
+    currentQueuedRelativeMousePacket = NULL;
+    currentQueuedAbsoluteMousePacket = NULL;
     memset(currentGamepadSensorState, 0, sizeof(currentGamepadSensorState));
-    memset(&currentRelativeMouseState, 0, sizeof(currentRelativeMouseState));
-    memset(&currentAbsoluteMouseState, 0, sizeof(currentAbsoluteMouseState));
     PltCreateMutex(&batchedInputMutex);
 
     return 0;
@@ -154,6 +153,9 @@ void destroyInputStream(void) {
         entry = nextEntry;
     }
 
+    memset(currentQueuedControllerPacket, 0, sizeof(currentQueuedControllerPacket));
+    currentQueuedRelativeMousePacket = NULL;
+    currentQueuedAbsoluteMousePacket = NULL;
     PltDeleteMutex(&batchedInputMutex);
 }
 
@@ -375,56 +377,55 @@ static void inputSendThreadProc(void* context) {
 
             PltLockMutex(&batchedInputMutex);
 
+            if (holder == currentQueuedRelativeMousePacket) {
+                currentQueuedRelativeMousePacket = NULL;
+            }
+
+            int deltaX = holder->relMouseDeltaX;
+            int deltaY = holder->relMouseDeltaY;
+
+            PltUnlockMutex(&batchedInputMutex);
+
             // Send as many packets as it takes to get the entire delta through
-            while (currentRelativeMouseState.deltaX != 0 || currentRelativeMouseState.deltaY != 0) {
+            while (deltaX != 0 || deltaY != 0) {
                 bool more = false;
 
-                if (currentRelativeMouseState.deltaX < INT16_MIN) {
+                if (deltaX < INT16_MIN) {
                     holder->packet.mouseMoveRel.deltaX = BE16(INT16_MIN);
-                    currentRelativeMouseState.deltaX -= INT16_MIN;
+                    deltaX -= INT16_MIN;
                     more = true;
                 }
-                else if (currentRelativeMouseState.deltaX > INT16_MAX) {
+                else if (deltaX > INT16_MAX) {
                     holder->packet.mouseMoveRel.deltaX = BE16(INT16_MAX);
-                    currentRelativeMouseState.deltaX -= INT16_MAX;
+                    deltaX -= INT16_MAX;
                     more = true;
                 }
                 else {
-                    holder->packet.mouseMoveRel.deltaX = BE16(currentRelativeMouseState.deltaX);
-                    currentRelativeMouseState.deltaX = 0;
+                    holder->packet.mouseMoveRel.deltaX = BE16(deltaX);
+                    deltaX = 0;
                 }
 
-                if (currentRelativeMouseState.deltaY < INT16_MIN) {
+                if (deltaY < INT16_MIN) {
                     holder->packet.mouseMoveRel.deltaY = BE16(INT16_MIN);
-                    currentRelativeMouseState.deltaY -= INT16_MIN;
+                    deltaY -= INT16_MIN;
                     more = true;
                 }
-                else if (currentRelativeMouseState.deltaY > INT16_MAX) {
+                else if (deltaY > INT16_MAX) {
                     holder->packet.mouseMoveRel.deltaY = BE16(INT16_MAX);
-                    currentRelativeMouseState.deltaY -= INT16_MAX;
+                    deltaY -= INT16_MAX;
                     more = true;
                 }
                 else {
-                    holder->packet.mouseMoveRel.deltaY = BE16(currentRelativeMouseState.deltaY);
-                    currentRelativeMouseState.deltaY = 0;
+                    holder->packet.mouseMoveRel.deltaY = BE16(deltaY);
+                    deltaY = 0;
                 }
-
-                // Don't hold the batching lock while we're doing network I/O
-                PltUnlockMutex(&batchedInputMutex);
 
                 // Encrypt and send the split packet
                 if (!sendInputPacket(holder, more)) {
                     freePacketHolder(holder);
                     return;
                 }
-
-                PltLockMutex(&batchedInputMutex);
             }
-
-            // The state change is no longer pending
-            currentRelativeMouseState.dirty = false;
-
-            PltUnlockMutex(&batchedInputMutex);
 
             lastMousePacketTime = now;
 
@@ -446,20 +447,9 @@ static void inputSendThreadProc(void* context) {
 
             PltLockMutex(&batchedInputMutex);
 
-            // Populate the packet with the latest state
-            holder->packet.mouseMoveAbs.x = BE16(currentAbsoluteMouseState.x);
-            holder->packet.mouseMoveAbs.y = BE16(currentAbsoluteMouseState.y);
-
-            // There appears to be a rounding error in GFE's scaling calculation which prevents
-            // the cursor from reaching the far edge of the screen when streaming at smaller
-            // resolutions with a higher desktop resolution (like streaming 720p with a desktop
-            // resolution of 1080p, or streaming 720p/1080p with a desktop resolution of 4K).
-            // Subtracting one from the reference dimensions seems to work around this issue.
-            holder->packet.mouseMoveAbs.width = BE16(currentAbsoluteMouseState.width - 1);
-            holder->packet.mouseMoveAbs.height = BE16(currentAbsoluteMouseState.height - 1);
-
-            // The state change is no longer pending
-            currentAbsoluteMouseState.dirty = false;
+            if (holder == currentQueuedAbsoluteMousePacket) {
+                currentQueuedAbsoluteMousePacket = NULL;
+            }
 
             PltUnlockMutex(&batchedInputMutex);
 
@@ -489,8 +479,9 @@ static void inputSendThreadProc(void* context) {
                     break;
                 }
 
-                // If the buttons or event type is different, we cannot batch
+                // If the buttons, tool type, or event type is different, we cannot batch
                 if (holder->packet.pen.penButtons != penBatchHolder->packet.pen.penButtons ||
+                    holder->packet.pen.toolType != penBatchHolder->packet.pen.toolType ||
                     holder->packet.pen.eventType != penBatchHolder->packet.pen.eventType) {
                     break;
                 }
@@ -499,6 +490,9 @@ static void inputSendThreadProc(void* context) {
                 if (LbqPollQueueElement(&packetQueue, (void**)&penBatchHolder) != LBQ_SUCCESS) {
                     break;
                 }
+
+                // Propagate the reliable flag if any packet in this batch required reliability
+                penBatchHolder->enetPacketFlags |= holder->enetPacketFlags;
 
                 // Replace the current packet with the new one
                 freePacketHolder(holder);
@@ -735,6 +729,7 @@ int stopInputStream(void) {
 int LiSendMouseMoveEvent(short deltaX, short deltaY) {
     PPACKET_HOLDER holder;
     int err;
+    bool enqueueHolder = false;
 
     if (!initialized) {
         return -2;
@@ -746,20 +741,15 @@ int LiSendMouseMoveEvent(short deltaX, short deltaY) {
 
     PltLockMutex(&batchedInputMutex);
 
-    // Combine the previous deltas with the new one
-    currentRelativeMouseState.deltaX += deltaX;
-    currentRelativeMouseState.deltaY += deltaY;
+    // Switching to relative motion ends any pending absolute mouse batch
+    currentQueuedAbsoluteMousePacket = NULL;
 
-    // Queue a packet holder if this is the only pending relative mouse event
-    if (!currentRelativeMouseState.dirty) {
-        // Set the dirty flag to claim ownership of inserting the packet holder
-        // and unlock to allow other threads to enqueue or process input.
-        currentRelativeMouseState.dirty = true;
+    holder = currentQueuedRelativeMousePacket;
+    if (!holder) {
         PltUnlockMutex(&batchedInputMutex);
 
         holder = allocatePacketHolder(0);
         if (holder == NULL) {
-            currentRelativeMouseState.dirty = false;
             return -1;
         }
 
@@ -777,21 +767,37 @@ int LiSendMouseMoveEvent(short deltaX, short deltaY) {
             holder->packet.mouseMoveRel.header.magic = LE32(MOUSE_MOVE_REL_MAGIC);
         }
 
-        // Remaining fields are set in the input thread based on the latest currentRelativeMouseState values
+        holder->relMouseDeltaX = 0;
+        holder->relMouseDeltaY = 0;
 
+        enqueueHolder = true;
+
+        PltLockMutex(&batchedInputMutex);
+        currentQueuedRelativeMousePacket = holder;
+    }
+
+    // Combine previous deltas with the new one
+    holder->relMouseDeltaX += deltaX;
+    holder->relMouseDeltaY += deltaY;
+
+    PltUnlockMutex(&batchedInputMutex);
+
+    if (enqueueHolder) {
         err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
         if (err != LBQ_SUCCESS) {
             LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
             Limelog("Input queue reached maximum size limit\n");
-            freePacketHolder(holder);
 
-            // We weren't able to insert the entry, so let the next call try again
-            currentRelativeMouseState.dirty = false;
+            PltLockMutex(&batchedInputMutex);
+            if (currentQueuedRelativeMousePacket == holder) {
+                currentQueuedRelativeMousePacket = NULL;
+            }
+            PltUnlockMutex(&batchedInputMutex);
+
+            freePacketHolder(holder);
         }
     }
     else {
-        // There's already a packet holder queued to send this event
-        PltUnlockMutex(&batchedInputMutex);
         err = 0;
     }
 
@@ -802,6 +808,7 @@ int LiSendMouseMoveEvent(short deltaX, short deltaY) {
 int LiSendMousePositionEvent(short x, short y, short referenceWidth, short referenceHeight) {
     PPACKET_HOLDER holder;
     int err;
+    bool enqueueHolder = false;
 
     if (!initialized) {
         return -2;
@@ -809,22 +816,15 @@ int LiSendMousePositionEvent(short x, short y, short referenceWidth, short refer
 
     PltLockMutex(&batchedInputMutex);
 
-    // Overwrite the previous mouse location with the new one
-    currentAbsoluteMouseState.x = x;
-    currentAbsoluteMouseState.y = y;
-    currentAbsoluteMouseState.width = referenceWidth;
-    currentAbsoluteMouseState.height = referenceHeight;
+    // Switching to absolute position ends any pending relative mouse batch
+    currentQueuedRelativeMousePacket = NULL;
 
-    // Queue a packet holder if this is the only pending absolute mouse event
-    if (!currentAbsoluteMouseState.dirty) {
-        // Set the dirty flag to claim ownership of inserting the packet holder
-        // and unlock to allow other threads to enqueue or process input.
-        currentAbsoluteMouseState.dirty = true;
+    holder = currentQueuedAbsoluteMousePacket;
+    if (!holder) {
         PltUnlockMutex(&batchedInputMutex);
 
         holder = allocatePacketHolder(0);
         if (holder == NULL) {
-            currentAbsoluteMouseState.dirty = false;
             return -1;
         }
 
@@ -837,21 +837,42 @@ int LiSendMousePositionEvent(short x, short y, short referenceWidth, short refer
         holder->packet.mouseMoveAbs.header.magic = LE32(MOUSE_MOVE_ABS_MAGIC);
         holder->packet.mouseMoveAbs.unused = 0;
 
-        // Remaining fields are set in the input thread based on the latest currentAbsoluteMouseState values
+        enqueueHolder = true;
 
+        PltLockMutex(&batchedInputMutex);
+        currentQueuedAbsoluteMousePacket = holder;
+    }
+
+    // Overwrite the previous mouse location with the new one
+    holder->packet.mouseMoveAbs.x = BE16(x);
+    holder->packet.mouseMoveAbs.y = BE16(y);
+
+    // There appears to be a rounding error in GFE's scaling calculation which prevents
+    // the cursor from reaching the far edge of the screen when streaming at smaller
+    // resolutions with a higher desktop resolution (like streaming 720p with a desktop
+    // resolution of 1080p, or streaming 720p/1080p with a desktop resolution of 4K).
+    // Subtracting one from the reference dimensions seems to work around this issue.
+    holder->packet.mouseMoveAbs.width = BE16(referenceWidth - 1);
+    holder->packet.mouseMoveAbs.height = BE16(referenceHeight - 1);
+
+    PltUnlockMutex(&batchedInputMutex);
+
+    if (enqueueHolder) {
         err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
         if (err != LBQ_SUCCESS) {
             LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
             Limelog("Input queue reached maximum size limit\n");
-            freePacketHolder(holder);
 
-            // We weren't able to insert the entry, so let the next call try again
-            currentAbsoluteMouseState.dirty = false;
+            PltLockMutex(&batchedInputMutex);
+            if (currentQueuedAbsoluteMousePacket == holder) {
+                currentQueuedAbsoluteMousePacket = NULL;
+            }
+            PltUnlockMutex(&batchedInputMutex);
+
+            freePacketHolder(holder);
         }
     }
     else {
-        // There's already a packet holder queued to send this event
-        PltUnlockMutex(&batchedInputMutex);
         err = 0;
     }
 
@@ -899,6 +920,14 @@ int LiSendMouseButtonEvent(char action, int button) {
     }
     holder->packet.mouseButton.header.magic = LE32(holder->packet.mouseButton.header.magic);
     holder->packet.mouseButton.button = (uint8_t)button;
+
+    // End any current mouse motion batches so that mouse movements that occurred
+    // before this button event are sent before it, and mouse movements that occur
+    // after this button event are sent after it.
+    PltLockMutex(&batchedInputMutex);
+    currentQueuedRelativeMousePacket = NULL;
+    currentQueuedAbsoluteMousePacket = NULL;
+    PltUnlockMutex(&batchedInputMutex);
 
     err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
     if (err != LBQ_SUCCESS) {
@@ -1181,6 +1210,13 @@ static int sendControllerEventInternal(short controllerNumber, short activeGamep
         if (err != LBQ_SUCCESS) {
             LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
             Limelog("Input queue reached maximum size limit\n");
+
+            PltLockMutex(&batchedInputMutex);
+            if (currentQueuedControllerPacket[controllerNumber] == holder) {
+                currentQueuedControllerPacket[controllerNumber] = NULL;
+            }
+            PltUnlockMutex(&batchedInputMutex);
+
             freePacketHolder(holder);
         }
     }
@@ -1424,10 +1460,13 @@ int LiSendPenEvent(uint8_t eventType, uint8_t toolType, uint8_t penButtons,
 
     holder->channelId = CTRL_CHANNEL_PEN;
 
-    // Allow move and hover events to be dropped if a newer one arrives (if no buttons changed),
+    // Allow move and hover events to be dropped if a newer one arrives (if no buttons or tool changed),
     // but don't allow state changing events like up/down/leave events to be dropped.
-    holder->enetPacketFlags = (TOUCH_EVENT_IS_BATCHABLE(eventType) && !(penButtons ^ currentPenButtonState)) ? 0 : ENET_PACKET_FLAG_RELIABLE;
+    holder->enetPacketFlags = (TOUCH_EVENT_IS_BATCHABLE(eventType) &&
+                               penButtons == currentPenButtonState &&
+                               toolType == currentPenToolType) ? 0 : ENET_PACKET_FLAG_RELIABLE;
     currentPenButtonState = penButtons;
+    currentPenToolType = toolType;
 
     holder->packet.pen.header.size = BE32(sizeof(SS_PEN_PACKET) - sizeof(uint32_t));
     holder->packet.pen.header.magic = LE32(SS_PEN_MAGIC);
