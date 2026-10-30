@@ -34,6 +34,7 @@ extern bool AudioEncryptionEnabled;
 extern bool ReferenceFrameInvalidationSupported;
 extern bool VideoFecControlSupported;
 extern bool ClientRoamingNegotiated;
+extern int NegotiatedChromaPacking;
 
 extern uint16_t RtspPortNumber;
 extern uint16_t ControlPortNumber;

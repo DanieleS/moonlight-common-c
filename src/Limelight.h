@@ -149,10 +149,31 @@ typedef struct _STREAM_CONFIGURATION {
     // when the host advertises roaming in its RTSP DESCRIBE response (a=x-rl-roaming);
     // with any other host nothing is sent and nothing changes.
     int clientRoaming;
+
+    // Packed 4:4:4 video ("chroma packing v1"): a full resolution 4:4:4 picture carried inside
+    // an ordinary 4:2:0 HEVC or AV1 picture of the size LiGetPackedCodedSize() gives, rebuilt by
+    // the client. This is the mask of packed modes (LI_PACKED444_MODE_* bits) the client has
+    // verified it can reconstruct. 0 = never use packing (the default). The mode is only used
+    // when the host advertises it in its RTSP DESCRIBE response; with any other host nothing
+    // changes. The bit depth follows supportedVideoFormats: 10-bit when it holds a Main10 format.
+    int packed444Modes;
 } STREAM_CONFIGURATION, *PSTREAM_CONFIGURATION;
 
 #define LI_ROAMING_ENABLED       0x01 // Follow network changes (only if the host advertises roaming)
 #define LI_ROAMING_ALLOW_METERED 0x02 // Also continue on a metered network (mobile data)
+
+// Packed 4:4:4 mode bits, in STREAM_CONFIGURATION.packed444Modes and in the host's
+// a=x-rl-video.packed444Modes attribute
+#define LI_PACKED444_MODE_HEVC_8   0x01
+#define LI_PACKED444_MODE_HEVC_10  0x02
+#define LI_PACKED444_MODE_AV1_8    0x04
+#define LI_PACKED444_MODE_AV1_10   0x08
+#define LI_PACKED444_MODE_MASK     0x0F
+
+// Wire names (RTSP DESCRIBE offer from the host, ANNOUNCE request from the client)
+#define LI_PACKED444_ATTR_VERSION  "x-rl-video.packed444Version"
+#define LI_PACKED444_ATTR_MODES    "x-rl-video.packed444Modes"
+#define LI_PACKED444_ATTR_REQUEST  "x-rl-video[0].chromaPacking"
 
 // Use this function to zero the stream configuration when allocated on the stack or heap
 void LiInitializeStreamConfiguration(PSTREAM_CONFIGURATION streamConfig);
@@ -1179,6 +1200,17 @@ bool LiIsDynamicFecNegotiated(void);
 // Returns true when client roaming was negotiated: the host advertised a=x-rl-roaming
 // and LI_ROAMING_ENABLED is set in the stream configuration. Valid after the RTSP handshake.
 bool LiIsClientRoamingNegotiated(void);
+
+// Returns 0 for a normal stream or 1 when a packed 4:4:4 stream (chroma packing v1) was
+// negotiated. Then the video setup() callback receives the coded size of the 4:2:0 picture
+// (LiGetPackedCodedSize()), while StreamConfig width/height stay the logical size. Valid after
+// the RTSP handshake.
+int LiGetNegotiatedChromaPacking(void);
+
+// Coded size of the 4:2:0 picture that carries a logical width x height packed 4:4:4 picture:
+// width rounded up to 64, twice the height rounded up to 8. Returns false when the logical size
+// is outside the protocol limits (1..16384 x 1..8192).
+bool LiGetPackedCodedSize(int width, int height, int* codedWidth, int* codedHeight);
 
 // Tells the library that the device's default network changed. Metered is true when the new
 // network is metered (mobile data). Thread-safe and cheap, and does nothing unless roaming

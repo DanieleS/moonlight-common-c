@@ -160,6 +160,23 @@ bool LiIsDynamicFecNegotiated(void) {
     return VideoFecControlSupported;
 }
 
+int LiGetNegotiatedChromaPacking(void) {
+    return NegotiatedChromaPacking;
+}
+
+bool LiGetPackedCodedSize(int width, int height, int* codedWidth, int* codedHeight) {
+    if (width < 1 || width > 16384 || height < 1 || height > 8192) {
+        return false;
+    }
+    if (codedWidth) {
+        *codedWidth = (width + 63) & ~63;
+    }
+    if (codedHeight) {
+        *codedHeight = 2 * ((height + 7) & ~7);
+    }
+    return true;
+}
+
 bool LiIsClientRoamingNegotiated(void) {
     return ClientRoamingNegotiated;
 }

@@ -317,6 +317,11 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
         }
     }
 
+    if (NegotiatedChromaPacking) {
+        // Ordinary 4:2:0 announce plus this line. The viewport below stays the logical size.
+        err |= addAttributeString(&optionHead, LI_PACKED444_ATTR_REQUEST, "1");
+    }
+
     snprintf(payloadStr, sizeof(payloadStr), "%d", StreamConfig.width);
     err |= addAttributeString(&optionHead, "x-nv-video[0].clientViewportWd", payloadStr);
     snprintf(payloadStr, sizeof(payloadStr), "%d", StreamConfig.height);
@@ -351,7 +356,8 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
     err |= addAttributeString(&optionHead, "x-nv-video[0].framesWithInvalidRefThreshold", "0");
 
     // 20% of the video bitrate will added to the user-specified bitrate for FEC
-    adjustedBitrate = (int)(StreamConfig.bitrate * 0.80);
+    // A packed 4:4:4 stream carries twice the pixels: reserve less for FEC and allow more
+    adjustedBitrate = (int)(StreamConfig.bitrate * (NegotiatedChromaPacking ? 0.70 : 0.80));
 
     // Use more strict bitrate logic when streaming remotely. The theory here is that remote
     // streaming is much more bandwidth sensitive. Someone might select 5 Mbps because that's
@@ -368,7 +374,8 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
     // GFE currently imposes a limit of 100 Mbps for the video bitrate. It will automatically
     // impose that on maximumBitrateKbps but not on initialBitrateKbps. We will impose the cap
     // ourselves so initialBitrateKbps does not exceed maximumBitrateKbps.
-    adjustedBitrate = adjustedBitrate > 100000 ? 100000 : adjustedBitrate;
+    int maxBitrate = NegotiatedChromaPacking ? 140000 : 100000;
+    adjustedBitrate = adjustedBitrate > maxBitrate ? maxBitrate : adjustedBitrate;
 
     // We don't support dynamic bitrate scaling properly (it tends to bounce between min and max and never
     // settle on the optimal bitrate if it's somewhere in the middle), so we'll just latch the bitrate

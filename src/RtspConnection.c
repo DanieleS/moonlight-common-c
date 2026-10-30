@@ -951,6 +951,51 @@ bool parseSdpAttributeToUInt(const char* payload, const char* name, uint32_t* va
     return true;
 }
 
+// Packed 4:4:4 (chroma packing v1): picks the 4:2:0 format that carries it, or returns 0 when
+// the host doesn't offer a mode this client verified. The depth follows what the user asked for
+// (a Main10 format in supportedVideoFormats), with no fallback across depths. AV1 comes before HEVC.
+static int selectPackedFormat(const char* payload, PSERVER_INFORMATION serverInfo) {
+    uint32_t hostVersion;
+    uint32_t hostModes;
+
+    if (!parseSdpAttributeToUInt(payload, LI_PACKED444_ATTR_VERSION, &hostVersion) ||
+            !parseSdpAttributeToUInt(payload, LI_PACKED444_ATTR_MODES, &hostModes)) {
+        Limelog("Packed 4:4:4 not offered by the host\n");
+        return 0;
+    }
+    if (hostVersion != 1 || (hostModes & LI_PACKED444_MODE_MASK) == 0) {
+        Limelog("Packed 4:4:4 offer not usable (version %u, modes %u)\n", hostVersion, hostModes);
+        return 0;
+    }
+
+    int modes = (int)(hostModes & LI_PACKED444_MODE_MASK) & StreamConfig.packed444Modes;
+    int formats = StreamConfig.supportedVideoFormats;
+    int scm = serverInfo->serverCodecModeSupport;
+
+    if (formats & (VIDEO_FORMAT_H265_MAIN10 | VIDEO_FORMAT_AV1_MAIN10)) {
+        if ((modes & LI_PACKED444_MODE_AV1_10) && (formats & VIDEO_FORMAT_AV1_MAIN10) && (scm & SCM_AV1_MAIN10)) {
+            return VIDEO_FORMAT_AV1_MAIN10;
+        }
+        if ((modes & LI_PACKED444_MODE_HEVC_10) && (formats & VIDEO_FORMAT_H265_MAIN10) && (scm & SCM_HEVC_MAIN10)) {
+            return VIDEO_FORMAT_H265_MAIN10;
+        }
+    }
+    else {
+        if ((modes & LI_PACKED444_MODE_AV1_8) && (formats & VIDEO_FORMAT_AV1_MAIN8) && (scm & SCM_AV1_MAIN8)) {
+            return VIDEO_FORMAT_AV1_MAIN8;
+        }
+        // Same HEVC check as the normal selection: the DESCRIBE reply carries the HEVC VPS
+        if ((modes & LI_PACKED444_MODE_HEVC_8) && (formats & VIDEO_FORMAT_H265) &&
+                strstr(payload, "sprop-parameter-sets=AAAAAU")) {
+            return VIDEO_FORMAT_H265;
+        }
+    }
+
+    Limelog("Packed 4:4:4: no mode in common (host %u, client %d, formats 0x%x)\n",
+            hostModes, StreamConfig.packed444Modes, formats);
+    return 0;
+}
+
 bool parseSdpAttributeToInt(const char* payload, const char* name, int* val) {
     // Find the entry for the specified attribute name
     char* attribute = strstr(payload, name);
@@ -1121,6 +1166,18 @@ int performRtspHandshake(PSERVER_INFORMATION serverInfo) {
         parseSdpAttributeToToken(response.payload, "x-ss-pyrowave.bitstream",
                                  hostPyroWaveBitstreamId, sizeof(hostPyroWaveBitstreamId));
 
+        // Packed 4:4:4 (chroma packing v1) wins over the normal choice below when the host
+        // offers a mode this client has verified. It never combines with PyroWave, 4:4:4
+        // or H.264 formats. Otherwise the normal selection runs exactly as without it.
+        NegotiatedChromaPacking = 0;
+        if (StreamConfig.packed444Modes & LI_PACKED444_MODE_MASK) {
+            int packedFormat = selectPackedFormat(response.payload, serverInfo);
+            if (packedFormat != 0) {
+                NegotiatedVideoFormat = packedFormat;
+                NegotiatedChromaPacking = 1;
+            }
+        }
+
         // PyroWave is only ever requested explicitly by the client, so it takes
         // precedence whenever the host advertises it. Some PyroWave hosts omit the
         // "PYROWAVE/90000" DESCRIBE marker, so the capability bits decide.
@@ -1137,7 +1194,10 @@ int performRtspHandshake(PSERVER_INFORMATION serverInfo) {
             pyroWaveOffered = false;
         }
 
-        if (pyroWaveOffered) {
+        if (NegotiatedChromaPacking) {
+            // Already selected above
+        }
+        else if (pyroWaveOffered) {
             if ((serverInfo->serverCodecModeSupport & SCM_PYROWAVE_HDR10_444) && (StreamConfig.supportedVideoFormats & VIDEO_FORMAT_PYROWAVE_HDR10_444)) {
                 NegotiatedVideoFormat = VIDEO_FORMAT_PYROWAVE_HDR10_444;
             }
