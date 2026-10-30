@@ -28,6 +28,7 @@ bool AudioEncryptionEnabled;
 bool ReferenceFrameInvalidationSupported;
 bool VideoFecControlSupported;
 bool ClientRoamingNegotiated;
+int NegotiatedChromaPacking;
 uint16_t RtspPortNumber;
 uint16_t ControlPortNumber;
 uint16_t AudioPortNumber;
@@ -268,6 +269,7 @@ int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION stre
     NegotiatedVideoFormat = 0;
     VideoFecControlSupported = false;
     ClientRoamingNegotiated = false;
+    NegotiatedChromaPacking = 0;
     memcpy(&StreamConfig, streamConfig, sizeof(StreamConfig));
     RemoteAddrString = strdup(serverInfo->address);
 

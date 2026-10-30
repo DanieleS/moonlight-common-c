@@ -465,8 +465,18 @@ int startVideoStream(void* rendererContext, int drFlags) {
     // This must be called before the decoder thread starts submitting
     // decode units
     LC_ASSERT(NegotiatedVideoFormat != 0);
-    err = VideoCallbacks.setup(NegotiatedVideoFormat, StreamConfig.width,
-        StreamConfig.height, StreamConfig.fps, rendererContext, drFlags);
+    int setupWidth = StreamConfig.width;
+    int setupHeight = StreamConfig.height;
+    if (NegotiatedChromaPacking) {
+        // A packed stream is coded at the padded, doubled size. StreamConfig keeps the logical
+        // size, which input mapping and the UI use.
+        if (!LiGetPackedCodedSize(StreamConfig.width, StreamConfig.height, &setupWidth, &setupHeight)) {
+            Limelog("Packed 4:4:4 size %dx%d is out of range\n", StreamConfig.width, StreamConfig.height);
+            return -1;
+        }
+    }
+    err = VideoCallbacks.setup(NegotiatedVideoFormat, setupWidth,
+        setupHeight, StreamConfig.fps, rendererContext, drFlags);
     if (err != 0) {
         return err;
     }
