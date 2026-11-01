@@ -303,7 +303,7 @@ void closeSocket(SOCKET s) {
 
 // These set "safe" host or link-local QoS options that we can unconditionally
 // set without having to worry about routers blockholing the traffic.
-static void setSocketQos(SOCKET s, int socketQosType) {
+static void setSocketQos(SOCKET s, int addressFamily, int socketQosType) {
 #ifdef SO_NET_SERVICE_TYPE
     int value;
     switch (socketQosType) {
@@ -324,6 +324,36 @@ static void setSocketQos(SOCKET s, int socketQosType) {
     // iOS/macOS
     if (setsockopt(s, SOL_SOCKET, SO_NET_SERVICE_TYPE, (char*)&value, sizeof(value)) < 0) {
         Limelog("setsockopt(SO_NET_SERVICE_TYPE, %d) failed: %d\n", value, (int)LastSocketError());
+    }
+#endif
+#ifdef IP_TOS
+    {
+        // DSCP: Expedited Forwarding (0xB8) for audio, AF41 (0x88) for video. A socket the
+        // OS refuses stays unmarked; that is logged once. Before SO_PRIORITY: on Linux,
+        // IP_TOS resets it.
+        static int tosRefused;
+        int tos = socketQosType == SOCK_QOS_TYPE_AUDIO ? 0xB8 :
+                  socketQosType == SOCK_QOS_TYPE_VIDEO ? 0x88 : 0;
+        int err = 0;
+        if (tos != 0) {
+#ifdef IPV6_TCLASS
+            if (addressFamily == AF_INET6) {
+                if (setsockopt(s, IPPROTO_IPV6, IPV6_TCLASS, (char*)&tos, sizeof(tos)) < 0) {
+                    err = (int)LastSocketError();
+                }
+                // IPv4-mapped remotes on this socket use IP_TOS: best effort.
+                setsockopt(s, IPPROTO_IP, IP_TOS, (char*)&tos, sizeof(tos));
+            }
+            else
+#endif
+            if (setsockopt(s, IPPROTO_IP, IP_TOS, (char*)&tos, sizeof(tos)) < 0) {
+                err = (int)LastSocketError();
+            }
+            if (err != 0 && !tosRefused) {
+                tosRefused = 1;
+                Limelog("DSCP marking 0x%x refused (%d): sending unmarked\n", tos, err);
+            }
+        }
     }
 #endif
 #ifdef SO_PRIORITY
@@ -417,7 +447,7 @@ SOCKET bindUdpSocket(int addressFamily, struct sockaddr_storage* localAddr, SOCK
 
     // Enable QOS for the socket (best effort)
     if (socketQosType != SOCK_QOS_TYPE_BEST_EFFORT) {
-        setSocketQos(s, socketQosType);
+        setSocketQos(s, addressFamily, socketQosType);
     }
 
 #ifdef __3DS__
