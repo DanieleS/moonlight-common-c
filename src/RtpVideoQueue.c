@@ -235,7 +235,11 @@ static int reconstructFrame(PRTP_VIDEO_QUEUE queue) {
         // receiving OOS data, which is unlikely because we've not seen any recently from this host.
         // PyroWave frames are delivered with holes (see completeBlockWithLostPackets()), so an
         // unrecoverable block is not a lost frame there.
+        // A block without parity can't tell a late packet from a lost one: any hole would be reported
+        // as a lost frame, so one packet overtaken on Wi-Fi would cost a frame and a keyframe. Its loss
+        // is reported when the next frame begins instead, by the existing path.
         if (isReferenceFrameInvalidationEnabled() && !queue->reportedLostFrame && !queue->receivedOosData &&
+                queue->bufferParityPackets > 0 &&
                 !(NegotiatedVideoFormat & VIDEO_FORMAT_MASK_PYROWAVE)) {
             // NB: We use totalPackets - neededPackets instead of just bufferParityPackets here because we require
             // one extra parity shard for recovery if we're in FEC validation mode.
