@@ -102,6 +102,10 @@ extern uint32_t EncryptionFeaturesEnabled;
 #define SS_TEXT_FOCUS_PTYPE 0x3020
 #define SS_TEXT_FOCUS_MIN_PAYLOAD_SIZE 8
 
+// Foundation Sunshine extension: 0x5506 param type RESOLUTION, answered by 0x5507 (u32 width, u32 height)
+#define SS_DYNAMIC_PARAM_TYPE_RESOLUTION 0
+#define SS_RESOLUTION_CHANGE_MIN_PAYLOAD_SIZE 8
+
 // Vibepollo extension: client sends SS_CAPTURE_ACTION_PTYPE messages. Next to
 // ML_FF_TEXT_FOCUS for the same reasons; the host's LI_FF_CAPTURE_ACTIONS is the same bit.
 #define ML_FF_CAPTURE_ACTIONS 0x20000

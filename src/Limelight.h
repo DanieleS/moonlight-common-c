@@ -612,6 +612,13 @@ typedef void(*ConnListenerSetControllerLED)(uint16_t controllerNumber, uint8_t r
 // This is a Vibepollo protocol extension.
 typedef void(*ConnListenerSetTextFocus)(uint8_t focusType);
 
+// This callback is invoked when the host reports the dimensions of the video frames from
+// now on, as the answer to LiRequestResolutionChange(). Frames of the previous size may
+// still arrive for a short while afterwards. Only the newest report is delivered when
+// several are pending. Runs on the async callback thread.
+// This is a Foundation Sunshine protocol extension.
+typedef void(*ConnListenerResolutionChanged)(uint32_t width, uint32_t height);
+
 typedef struct _CONNECTION_LISTENER_CALLBACKS {
     ConnListenerStageStarting stageStarting;
     ConnListenerStageComplete stageComplete;
@@ -627,6 +634,7 @@ typedef struct _CONNECTION_LISTENER_CALLBACKS {
     ConnListenerSetControllerLED setControllerLED;
     ConnListenerSetAdaptiveTriggers setAdaptiveTriggers;
     ConnListenerSetTextFocus setTextFocus;
+    ConnListenerResolutionChanged resolutionChanged;
 } CONNECTION_LISTENER_CALLBACKS, *PCONNECTION_LISTENER_CALLBACKS;
 
 // Use this function to zero the connection callbacks when allocated on the stack or heap
@@ -733,6 +741,15 @@ int LiSendExecServerCmd(uint8_t cmdId);
 // This function may only be called between LiStartConnection() and LiStopConnection().
 // This is a Vibepollo protocol extension.
 int LiSendCaptureAction(uint8_t action);
+
+// Foundation Sunshine extension. Asks the host to change the stream resolution without
+// ending the stream. Zero means sent, not applied: the client must observe a frame at the
+// requested dimensions (see ConnListenerResolutionChanged()) and reconnect on timeout.
+// -1: invalid dimensions (each 1..16384 and even); -2: unsupported (not Sunshine, no
+// encrypted control stream, or the host did not advertise LI_FF_CLIENT_RESOLUTION_CHANGE);
+// -3: disconnected; -4: send failed.
+// This function may only be called between LiStartConnection() and LiStopConnection().
+int LiRequestResolutionChange(int width, int height);
 
 // This function sends an empty payload to the server.
 // This method exists here for workaround client side wifi sleeps.
@@ -1236,7 +1253,8 @@ void LiRequestIdrFrame(void);
 // This function returns any extended feature flags supported by the host.
 #define LI_FF_PEN_TOUCH_EVENTS        0x01 // LiSendTouchEvent()/LiSendPenEvent() supported
 #define LI_FF_CONTROLLER_TOUCH_EVENTS 0x02 // LiSendControllerTouchEvent() supported
-#define LI_FF_TEXT_FOCUS              0x10000 // Host can report text field focus (ConnListenerSetTextFocus())
+#define LI_FF_CLIENT_RESOLUTION_CHANGE 0x400 // Host accepts LiRequestResolutionChange()
+#define LI_FF_TEXT_FOCUS             0x10000 // Host can report text field focus (ConnListenerSetTextFocus())
 #define LI_FF_CAPTURE_ACTIONS         0x20000 // Host carries out capture actions (LiSendCaptureAction())
 #define LI_FF_CAPTURE_AVAILABLE       0x40000 // Host has a capture tool configured for this session
 uint32_t LiGetHostFeatureFlags(void);
