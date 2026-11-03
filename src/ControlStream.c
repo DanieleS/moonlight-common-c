@@ -87,6 +87,10 @@ typedef struct _QUEUED_ASYNC_CALLBACK {
         struct {
             uint8_t focusType;
         } setTextFocus;
+        struct {
+            uint32_t width;
+            uint32_t height;
+        } resolutionChange;
     } data;
     LINKED_BLOCKING_QUEUE_ENTRY entry;
 } QUEUED_ASYNC_CALLBACK, *PQUEUED_ASYNC_CALLBACK;
@@ -161,6 +165,8 @@ static PPLT_CRYPTO_CONTEXT decryptionCtx;
 #define IDX_FILE_TRANSFER_NONCE_REQUEST 14
 #define IDX_DS_ADAPTIVE_TRIGGERS 15
 #define IDX_TEXT_FOCUS 16
+#define IDX_DYNAMIC_PARAM_CHANGE 17
+#define IDX_RESOLUTION_CHANGE 18
 
 #define CONTROL_STREAM_TIMEOUT_SEC 10
 #define CONTROL_STREAM_LINGER_TIMEOUT_SEC 2
@@ -183,6 +189,8 @@ static const short packetTypesGen3[] = {
     -1,     // File transfer nonce request (unused)
     -1,     // Set Adaptive Triggers (unused)
     -1,     // Text field focus (unused)
+    -1,     // Dynamic param change (unused)
+    -1,     // Resolution change (unused)
 };
 static const short packetTypesGen4[] = {
     0x0606, // Request IDR frame
@@ -202,6 +210,8 @@ static const short packetTypesGen4[] = {
     -1,     // File transfer nonce request (unused)
     -1,     // Set Adaptive Triggers (unused)
     -1,     // Text field focus (unused)
+    -1,     // Dynamic param change (unused)
+    -1,     // Resolution change (unused)
 };
 static const short packetTypesGen5[] = {
     0x0305, // Start A
@@ -221,6 +231,8 @@ static const short packetTypesGen5[] = {
     -1,     // File transfer nonce request (unused)
     -1,     // Set Adaptive Triggers (unused)
     -1,     // Text field focus (unused)
+    -1,     // Dynamic param change (unused)
+    -1,     // Resolution change (unused)
 };
 static const short packetTypesGen7[] = {
     0x0305, // Start A
@@ -240,6 +252,8 @@ static const short packetTypesGen7[] = {
     -1,     // File transfer nonce request (unused)
     -1,     // Set Adaptive Triggers (unused)
     -1,     // Text field focus (unused)
+    -1,     // Dynamic param change (unused)
+    -1,     // Resolution change (unused)
 };
 static const short packetTypesGen7Enc[] = {
     0x0302, // Request IDR frame
@@ -259,6 +273,8 @@ static const short packetTypesGen7Enc[] = {
     0x3002, // File transfer nonce request (Apollo protocol extension)
     0x5503, // Set Adaptive Triggers (Sunshine protocol extension)
     SS_TEXT_FOCUS_PTYPE, // Text field focus (Vibepollo protocol extension)
+    0x5506, // Dynamic param change (Foundation Sunshine protocol extension)
+    0x5507, // Resolution change (Foundation Sunshine protocol extension)
 };
 
 static const char requestIdrFrameGen3[] = { 0, 0 };
@@ -1103,6 +1119,22 @@ static void asyncCallbackThreadFunc(void* context) {
                                                   queuedCb->data.dsAdaptiveTrigger.left,
                                                   queuedCb->data.dsAdaptiveTrigger.right);
             break;
+        case IDX_RESOLUTION_CHANGE:
+            // Only the newest size matters, so collapse any queued behind this one
+            while (LbqPeekQueueElement(&asyncCallbackQueue, (void**)&nextCb) == LBQ_SUCCESS && nextCb->typeIndex == queuedCb->typeIndex) {
+                // This entry is batchable, so pop it off the queue
+                if (LbqPollQueueElement(&asyncCallbackQueue, (void**)&nextCb) != LBQ_SUCCESS) {
+                    break;
+                }
+
+                // Replace the old entry with the new one
+                free(queuedCb);
+                queuedCb = nextCb;
+            }
+
+            ListenerCallbacks.resolutionChanged(queuedCb->data.resolutionChange.width,
+                                                queuedCb->data.resolutionChange.height);
+            break;
         case IDX_TEXT_FOCUS:
             // Focus is a state, so only the newest report matters. Collapse any queued
             // behind this one rather than flashing a keyboard through each of them.
@@ -1138,7 +1170,8 @@ static bool needsAsyncCallback(unsigned short packetType) {
            packetType == packetTypes[IDX_SET_CLIPBOARD] ||
            packetType == packetTypes[IDX_FILE_TRANSFER_NONCE_REQUEST] ||
            packetType == packetTypes[IDX_DS_ADAPTIVE_TRIGGERS] ||
-           packetType == packetTypes[IDX_TEXT_FOCUS];
+           packetType == packetTypes[IDX_TEXT_FOCUS] ||
+           packetType == packetTypes[IDX_RESOLUTION_CHANGE];
 }
 
 static void queueAsyncCallback(PNVCTL_ENET_PACKET_HEADER_V1 ctlHdr, int packetLength) {
@@ -1241,6 +1274,31 @@ static void queueAsyncCallback(PNVCTL_ENET_PACKET_HEADER_V1 ctlHdr, int packetLe
 
         queuedCb->data.setTextFocus.focusType = focusType;
         queuedCb->typeIndex = IDX_TEXT_FOCUS;
+    }
+    else if (ctlHdr->type == packetTypes[IDX_RESOLUTION_CHANGE]) {
+        uint32_t width, height;
+
+        // Only a host that advertised the extension sends this, and only in answer to our
+        // request. Anything else, or a short payload, is ignored.
+        if (!IS_SUNSHINE() || !(SunshineFeatureFlags & LI_FF_CLIENT_RESOLUTION_CHANGE) ||
+                packetLength - (int)sizeof(*ctlHdr) < SS_RESOLUTION_CHANGE_MIN_PAYLOAD_SIZE) {
+            Limelog("Ignoring resolution change (host flags: 0x%x, length: %d)\n",
+                    SunshineFeatureFlags, packetLength - (int)sizeof(*ctlHdr));
+            free(queuedCb);
+            return;
+        }
+
+        BbGet32(&bb, &width);
+        BbGet32(&bb, &height);
+
+        if (width == 0 || height == 0) {
+            free(queuedCb);
+            return;
+        }
+
+        queuedCb->data.resolutionChange.width = width;
+        queuedCb->data.resolutionChange.height = height;
+        queuedCb->typeIndex = IDX_RESOLUTION_CHANGE;
     }
     else {
         // Unhandled packet type from needsAsyncCallback()
@@ -2403,6 +2461,29 @@ int LiSendExecServerCmd(uint8_t cmdId) {
         ENET_PACKET_FLAG_RELIABLE,
         false
     );
+}
+
+int LiRequestResolutionChange(int width, int height) {
+    uint32_t payload[3];
+
+    if (width <= 0 || height <= 0 || width > 16384 || height > 16384 ||
+            (width & 1) || (height & 1)) {
+        return -1;
+    }
+    if (!IS_SUNSHINE() || !encryptedControlStream || AppVersionQuad[0] < 5 ||
+            packetTypes == NULL || packetTypes[IDX_DYNAMIC_PARAM_CHANGE] == -1 ||
+            !(SunshineFeatureFlags & LI_FF_CLIENT_RESOLUTION_CHANGE)) {
+        return -2;
+    }
+    if (stopping || peer == NULL || peer->state != ENET_PEER_STATE_CONNECTED) {
+        return -3;
+    }
+
+    payload[0] = LE32(SS_DYNAMIC_PARAM_TYPE_RESOLUTION);
+    payload[1] = LE32((uint32_t)width);
+    payload[2] = LE32((uint32_t)height);
+    return sendMessageAndForget(packetTypes[IDX_DYNAMIC_PARAM_CHANGE], sizeof(payload), payload,
+                                CTRL_CHANNEL_GENERIC, ENET_PACKET_FLAG_RELIABLE, false) ? 0 : -4;
 }
 
 int LiSendCaptureAction(uint8_t action) {
