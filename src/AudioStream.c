@@ -349,7 +349,7 @@ static void AudioReceiveThreadProc(void* context) {
             }
         }
 
-        packet->header.size = recvUdpSocket(curSocket, &packet->data[0], MAX_PACKET_SIZE, useSelect);
+        packet->header.size = recvUdpSocket(curSocket, &packet->data[0], MAX_PACKET_SIZE, useSelect, NULL, NULL);
         if (packet->header.size < 0 && ClientRoamingNegotiated && waitForAudioSocketRebind(curSocket)) {
             // The socket was replaced while we were receiving on the old one
             continue;
