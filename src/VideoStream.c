@@ -231,7 +231,7 @@ static void destroyVideoRecvBatch(VIDEO_RECV_BATCH_STATE* state) {
 // Same contract as recvUdpSocket(): the length, 0 on timeout, negative on error
 static int recvVideoDatagram(VIDEO_RECV_BATCH_STATE* state, SOCKET s, char* dst, int size, bool useSelect) {
     if (state == NULL || state->disabled) {
-        return recvUdpSocket(s, dst, size, useSelect);
+        return recvUdpSocket(s, dst, size, useSelect, NULL, NULL);
     }
 
     for (;;) {
@@ -278,7 +278,7 @@ static int recvVideoDatagram(VIDEO_RECV_BATCH_STATE* state, SOCKET s, char* dst,
         if (error == ENOSYS || error == EPERM || error == EOPNOTSUPP || error == EINVAL) {
             Limelog("Video Receive: recvmmsg() unavailable (%d), receiving one datagram per call\n", error);
             state->disabled = true;
-            return recvUdpSocket(s, dst, size, useSelect);
+            return recvUdpSocket(s, dst, size, useSelect, NULL, NULL);
         }
         return -1;
     }
@@ -389,7 +389,9 @@ static void VideoReceiveThreadProc(void* context) {
             err = recvUdpSocket(curSocket,
                                 encrypted ? encryptedBuffer : buffer,
                                 receiveSize,
-                                useSelect);
+                                useSelect,
+                                NULL,
+                                NULL);
 #endif
         }
         if (err < 0 && ClientRoamingNegotiated && waitForVideoSocketRebind(curSocket)) {
