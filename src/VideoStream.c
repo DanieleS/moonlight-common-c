@@ -1,3 +1,7 @@
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE // recvmmsg()
+#endif
+
 #include "Limelight-internal.h"
 #include "ClientRoaming.h"
 
@@ -179,6 +183,108 @@ static bool waitForVideoSocketRebind(SOCKET failedSocket) {
     return rtpSocket != failedSocket;
 }
 
+#if defined(__linux__)
+// Linux and Android: take every datagram already queued on the video socket with one
+// recvmmsg() call (MSG_WAITFORONE waits for the first datagram only, so nothing waits to
+// fill a batch). Where the kernel refuses recvmmsg(), receives fall back to one per call.
+#define VIDEO_RECV_BATCH 32
+
+typedef struct _VIDEO_RECV_BATCH_STATE {
+    struct mmsghdr msgs[VIDEO_RECV_BATCH];
+    struct iovec iov[VIDEO_RECV_BATCH];
+    char* slots;
+    int slotSize;
+    int count;
+    int next;
+    bool disabled;
+} VIDEO_RECV_BATCH_STATE;
+
+static VIDEO_RECV_BATCH_STATE* createVideoRecvBatch(int slotSize) {
+    VIDEO_RECV_BATCH_STATE* state = (VIDEO_RECV_BATCH_STATE*)calloc(1, sizeof(*state));
+    int i;
+
+    if (state == NULL) {
+        return NULL;
+    }
+    state->slots = (char*)malloc((size_t)slotSize * VIDEO_RECV_BATCH);
+    if (state->slots == NULL) {
+        free(state);
+        return NULL;
+    }
+    state->slotSize = slotSize;
+    for (i = 0; i < VIDEO_RECV_BATCH; i++) {
+        state->iov[i].iov_base = state->slots + (size_t)i * slotSize;
+        state->iov[i].iov_len = slotSize;
+        state->msgs[i].msg_hdr.msg_iov = &state->iov[i];
+        state->msgs[i].msg_hdr.msg_iovlen = 1;
+    }
+    return state;
+}
+
+static void destroyVideoRecvBatch(VIDEO_RECV_BATCH_STATE* state) {
+    if (state != NULL) {
+        free(state->slots);
+        free(state);
+    }
+}
+
+// Same contract as recvUdpSocket(): the length, 0 on timeout, negative on error
+static int recvVideoDatagram(VIDEO_RECV_BATCH_STATE* state, SOCKET s, char* dst, int size, bool useSelect) {
+    if (state == NULL || state->disabled) {
+        return recvUdpSocket(s, dst, size, useSelect);
+    }
+
+    for (;;) {
+        int n, error;
+
+        if (state->next < state->count) {
+            int length = (int)state->msgs[state->next].msg_len;
+            memcpy(dst, state->slots + (size_t)state->next * state->slotSize, length);
+            state->next++;
+            return length;
+        }
+
+        if (useSelect) {
+            struct pollfd pfd;
+
+            pfd.fd = s;
+            pfd.events = POLLIN;
+            n = pollSockets(&pfd, 1, UDP_RECV_POLL_TIMEOUT_MS);
+            if (n <= 0) {
+                return n;
+            }
+        }
+
+        // Without select the socket has SO_RCVTIMEO, which bounds the wait for the first datagram
+        n = recvmmsg(s, state->msgs, VIDEO_RECV_BATCH,
+                     MSG_WAITFORONE | (useSelect ? MSG_DONTWAIT : 0), NULL);
+        if (n > 0) {
+            state->count = n;
+            state->next = 0;
+            continue;
+        }
+        if (n == 0) {
+            return 0;
+        }
+
+        error = LastSocketError();
+        if (error == EWOULDBLOCK || error == EAGAIN || error == EINTR || error == ETIMEDOUT) {
+            return 0;
+        }
+        if (error == ECONNREFUSED) {
+            // An earlier ICMP Port Unreachable: ignore it as recvUdpSocket() does
+            continue;
+        }
+        if (error == ENOSYS || error == EPERM || error == EOPNOTSUPP || error == EINVAL) {
+            Limelog("Video Receive: recvmmsg() unavailable (%d), receiving one datagram per call\n", error);
+            state->disabled = true;
+            return recvUdpSocket(s, dst, size, useSelect);
+        }
+        return -1;
+    }
+}
+#endif
+
 // Receive thread proc
 static void VideoReceiveThreadProc(void* context) {
     int err;
@@ -191,6 +297,9 @@ static void VideoReceiveThreadProc(void* context) {
     bool encrypted;
     bool usePartialFrameTimeout;
     SOCKET curSocket;
+#if defined(__linux__)
+    VIDEO_RECV_BATCH_STATE* recvBatch = NULL;
+#endif
 
     encrypted =!!(EncryptionFeaturesEnabled & SS_ENC_VIDEO);
     decryptedSize = StreamConfig.packetSize + MAX_RTP_HEADER_SIZE;
@@ -214,6 +323,13 @@ static void VideoReceiveThreadProc(void* context) {
     else {
         encryptedBuffer = NULL;
     }
+
+#if defined(__linux__)
+    // The PyroWave path drains a nonblocking socket on its own
+    if (!usePartialFrameTimeout) {
+        recvBatch = createVideoRecvBatch(receiveSize);
+    }
+#endif
 
     waitingForVideoMs = 0;
     while (!PltIsThreadInterrupted(&receiveThread)) {
@@ -265,10 +381,16 @@ static void VideoReceiveThreadProc(void* context) {
                                           receiveSize, timeoutMs);
         }
         else {
+#if defined(__linux__)
+            err = recvVideoDatagram(recvBatch, curSocket,
+                                    encrypted ? encryptedBuffer : buffer,
+                                    receiveSize, useSelect);
+#else
             err = recvUdpSocket(curSocket,
                                 encrypted ? encryptedBuffer : buffer,
                                 receiveSize,
                                 useSelect);
+#endif
         }
         if (err < 0 && ClientRoamingNegotiated && waitForVideoSocketRebind(curSocket)) {
             // The socket was replaced while we were receiving on the old one
@@ -381,6 +503,10 @@ static void VideoReceiveThreadProc(void* context) {
     if (encryptedBuffer != NULL) {
         free(encryptedBuffer);
     }
+
+#if defined(__linux__)
+    destroyVideoRecvBatch(recvBatch);
+#endif
 }
 
 void notifyKeyFrameReceived(void) {
