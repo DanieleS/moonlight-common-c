@@ -28,7 +28,11 @@ static uint16_t pyrowaveCriticalPackets;
 
 #define DR_CLEANUP -1000
 
-#define CONSECUTIVE_DROP_LIMIT 120
+// A long RFI window can leave an inter-frame codec displaying error-concealed
+// pictures while it waits for the host to recover the reference chain.  Keep
+// isolated losses on the cheaper RFI path, but escalate a short contiguous
+// burst to an IDR before the concealment becomes visibly persistent.
+#define CONSECUTIVE_DROP_IDR_LIMIT 8
 static unsigned int consecutiveFrameDrops;
 
 static LINKED_BLOCKING_QUEUE decodeUnitQueue;
@@ -78,6 +82,7 @@ void initializeVideoDepacketizer(int pktSize) {
     lastPacketPayloadLength = 0;
     dropStatePending = false;
     idrFrameProcessed = false;
+    consecutiveFrameDrops = 0;
     pyrowaveCriticalPackets = 0;
     strictIdrFrameWait = !isReferenceFrameInvalidationEnabled();
 }
@@ -119,8 +124,9 @@ static void dropFrameState(void) {
     consecutiveFrameDrops++;
 
     // If we reach our limit, immediately request an IDR frame and reset
-    if (consecutiveFrameDrops == CONSECUTIVE_DROP_LIMIT) {
-        Limelog("Reached consecutive drop limit\n");
+    if (consecutiveFrameDrops == CONSECUTIVE_DROP_IDR_LIMIT) {
+        Limelog("Reached consecutive drop limit (%u); requesting IDR frame\n",
+                CONSECUTIVE_DROP_IDR_LIMIT);
 
         // Restart the count
         consecutiveFrameDrops = 0;
