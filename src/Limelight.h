@@ -1064,6 +1064,11 @@ int LiFindExternalAddressIP4(const char* stunServer, unsigned short stunPort, un
 // if CAPABILITY_DIRECT_SUBMIT is not set for the video renderer.
 int LiGetPendingVideoFrames(void);
 
+// Frames dropped because the decode unit queue overflowed since the stream started: the
+// overflowing frame and every frame dropped until the IDR frame it requested. Decoder backlog,
+// not network loss. Safe to call from any thread.
+uint64_t LiGetDecoderDrops(void);
+
 // Returns the number of queued audio frames ready for delivery. Only relevant
 // if CAPABILITY_DIRECT_SUBMIT is not set for the audio renderer. For most uses,
 // LiGetPendingAudioDuration() is probably a better option than this function.
