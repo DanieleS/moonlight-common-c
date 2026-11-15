@@ -1,11 +1,18 @@
 #include "Limelight-internal.h"
 
+#include <stdatomic.h>
+
 // Uncomment to test 3 byte Annex B start sequences with GFE
 //#define FORCE_3_BYTE_START_SEQUENCES
 
 static PLENTRY nalChainHead;
 static PLENTRY nalChainTail;
 static int nalChainDataLength;
+
+// Set while frames are dropped because the decode unit queue overflowed, so dropFrameState()
+// can tell those drops (the decoder fell behind) from drops caused by network loss
+static bool decoderOverflow;
+static atomic_uint_fast64_t decoderDrops;
 
 static unsigned int nextFrameNumber;
 static unsigned int startFrameNumber;
@@ -67,6 +74,8 @@ typedef struct _LENTRY_INTERNAL {
 void initializeVideoDepacketizer(int pktSize) {
     LbqInitializeLinkedBlockingQueue(&decodeUnitQueue, 15);
 
+    decoderOverflow = false;
+    atomic_store_explicit(&decoderDrops, 0, memory_order_relaxed);
     nextFrameNumber = 1;
     startFrameNumber = 0;
     waitingForNextSuccessfulFrame = false;
@@ -106,6 +115,11 @@ static void cleanupFrameState(void) {
 static void dropFrameState(void) {
     // This may only be called at frame boundaries
     LC_ASSERT(!decodingFrame);
+
+    // Count frames dropped by a decode unit queue overflow apart from network loss
+    if (decoderOverflow) {
+        atomic_fetch_add_explicit(&decoderDrops, 1, memory_order_relaxed);
+    }
 
     // We're dropping frame state now
     dropStatePending = false;
@@ -530,6 +544,7 @@ static void reassembleFrame(int frameNumber, bool frameIsLTR) {
 
                     // RFI recovery is not supported here
                     waitingForIdrFrame = true;
+                    decoderOverflow = true;
 
                     // Clear NAL state for the frame that we failed to enqueue
                     nalChainHead = qdu->decodeUnit.bufferList;
@@ -552,6 +567,9 @@ static void reassembleFrame(int frameNumber, bool frameIsLTR) {
                 validateDecodeUnitForPlayback(&qdu->decodeUnit);
                 LiCompleteVideoFrame(qdu, VideoCallbacks.submitDecodeUnit(&qdu->decodeUnit));
             }
+
+            // The frame was queued or submitted, so the overflow is over
+            decoderOverflow = false;
 
             // Notify the control connection
             connectionReceivedCompleteFrame(frameNumber, frameIsLTR);
@@ -1224,4 +1242,8 @@ void queueRtpPacket(PRTPV_QUEUE_ENTRY queueEntryPtr) {
 
 int LiGetPendingVideoFrames(void) {
     return LbqGetItemCount(&decodeUnitQueue);
+}
+
+uint64_t LiGetDecoderDrops(void) {
+    return atomic_load_explicit(&decoderDrops, memory_order_relaxed);
 }
