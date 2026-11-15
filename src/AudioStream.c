@@ -535,7 +535,6 @@ int startAudioStream(void* audioContext, int arFlags) {
     err = PltCreateThread("AudioRecv", AudioReceiveThreadProc, NULL, &receiveThread);
     if (err != 0) {
         AudioCallbacks.stop();
-        closeSocket(rtpSocket);
         AudioCallbacks.cleanup();
         return err;
     }
@@ -546,7 +545,6 @@ int startAudioStream(void* audioContext, int arFlags) {
             AudioCallbacks.stop();
             PltInterruptThread(&receiveThread);
             PltJoinThread(&receiveThread);
-            closeSocket(rtpSocket);
             AudioCallbacks.cleanup();
             return err;
         }
