@@ -120,8 +120,9 @@ static uint32_t lastSeenFrame;
 static bool stopping;
 static bool disconnectPending;
 static bool encryptedControlStream;
-static bool hdrEnabled;
+static atomic_bool hdrEnabled;
 static SS_HDR_METADATA hdrMetadata;
+static PLT_MUTEX hdrMutex;
 
 // Only touched on the control stream receive thread, and reset before it starts
 static uint32_t lastTextFocusSequence;
@@ -366,6 +367,7 @@ int initializeControlStream(void) {
     LbqInitializeLinkedBlockingQueue(&frameFecStatusQueue, 8); // Limits number of frame status reports per periodic ping interval
     LbqInitializeLinkedBlockingQueue(&asyncCallbackQueue, 30);
     PltCreateMutex(&enetMutex);
+    PltCreateMutex(&hdrMutex);
     PltCreateMutex(&fecSummaryMutex);
     fecSummaryDataPackets = fecSummaryMissingPackets = fecSummarySequence = 0;
     fecSummaryLastSentMs = PltGetMillis();
@@ -420,7 +422,7 @@ int initializeControlStream(void) {
     usePeriodicPing = APP_VERSION_AT_LEAST(7, 1, 415);
     encryptionCtx = PltCreateCryptoContext();
     decryptionCtx = PltCreateCryptoContext();
-    hdrEnabled = false;
+    atomic_store_explicit(&hdrEnabled, false, memory_order_relaxed);
     memset(&hdrMetadata, 0, sizeof(hdrMetadata));
 
     return 0;
@@ -447,6 +449,7 @@ void destroyControlStream(void) {
     freeBasicLbqList(LbqDestroyLinkedBlockingQueue(&asyncCallbackQueue));
 
     PltDeleteMutex(&fecSummaryMutex);
+    PltDeleteMutex(&hdrMutex);
     PltDeleteMutex(&enetMutex);
 }
 
@@ -1124,7 +1127,7 @@ static void asyncCallbackThreadFunc(void* context) {
                 queuedCb = nextCb;
             }
 
-            ListenerCallbacks.setHdrMode(hdrEnabled);
+            ListenerCallbacks.setHdrMode(LiGetCurrentHostDisplayHdrMode());
             break;
 
         case IDX_SET_MOTION_EVENT:
@@ -1505,6 +1508,8 @@ static void controlReceiveThreadFunc(void* context) {
 
                 BbInitializeWrappedBuffer(&bb, (char*)ctlHdr, sizeof(*ctlHdr), packetLength - sizeof(*ctlHdr), BYTE_ORDER_LITTLE);
 
+                PltLockMutex(&hdrMutex);
+
                 BbGet8(&bb, &enableByte);
                 if (IS_SUNSHINE()) {
                     // Zero the metadata buffer to properly handle older servers if we have to add new fields
@@ -1524,7 +1529,9 @@ static void controlReceiveThreadFunc(void* context) {
                     BbGet16(&bb, &hdrMetadata.maxFullFrameLuminance);
                 }
 
-                hdrEnabled = (enableByte != 0);
+                atomic_store_explicit(&hdrEnabled, enableByte != 0, memory_order_release);
+
+                PltUnlockMutex(&hdrMutex);
             }
 
             // Process client callbacks in a separate thread
@@ -2460,15 +2467,25 @@ int startControlStream(void) {
 }
 
 bool LiGetCurrentHostDisplayHdrMode(void) {
-    return hdrEnabled;
+    return atomic_load_explicit(&hdrEnabled, memory_order_acquire);
 }
 
 bool LiGetHdrMetadata(PSS_HDR_METADATA metadata) {
-    if (!IS_SUNSHINE() || !hdrEnabled) {
+    if (!IS_SUNSHINE() || !atomic_load_explicit(&hdrEnabled, memory_order_acquire)) {
+        return false;
+    }
+
+    PltLockMutex(&hdrMutex);
+
+    // Check again inside the lock to make sure HDR is still enabled
+    if (!atomic_load_explicit(&hdrEnabled, memory_order_relaxed)) {
+        PltUnlockMutex(&hdrMutex);
         return false;
     }
 
     *metadata = hdrMetadata;
+    PltUnlockMutex(&hdrMutex);
+
     return true;
 }
 
