@@ -315,6 +315,14 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
         else {
             err |= addAttributeString(&optionHead, "x-ss-video[0].chromaSamplingType", "0");
         }
+
+        // Add intra-refresh if opted in
+        if (VideoCallbacks.capabilities & CAPABILITY_INTRA_REFRESH) {
+            err |= addAttributeString(&optionHead, "x-ss-video[0].intraRefresh", "1");
+        }
+        else {
+            err |= addAttributeString(&optionHead, "x-ss-video[0].intraRefresh", "0");
+        }
     }
 
     if (NegotiatedChromaPacking) {
