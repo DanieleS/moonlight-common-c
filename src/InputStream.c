@@ -1,4 +1,5 @@
 #include "Limelight-internal.h"
+#include "FrameWarp.h"
 
 static SOCKET inputSock = INVALID_SOCKET;
 static unsigned char currentAesIv[16];
@@ -258,7 +259,11 @@ static bool sendInputPacket(PPACKET_HOLDER holder, bool moreData) {
     // has been removed. We send the plaintext packet through and the control stream code will do
     // the encryption.
     if (encryptedControlStream) {
-        err = (SOCK_RET)sendInputPacketOnControlStream((unsigned char*)&holder->packet,
+        // This is the one place every input packet goes through after mouse batching and the
+        // int16 splitting, so Frame Warp counts here, what actually goes on the wire.
+        FrameWarpCountInputPacket(&holder->packet);
+
+        err =(SOCK_RET)sendInputPacketOnControlStream((unsigned char*)&holder->packet,
                                                         PACKET_SIZE(holder),
                                                         holder->channelId,
                                                         holder->enetPacketFlags,

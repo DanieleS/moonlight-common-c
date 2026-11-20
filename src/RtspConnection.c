@@ -1,5 +1,6 @@
 #include "Limelight-internal.h"
 #include "Rtsp.h"
+#include "FrameWarp.h"
 
 #define RTSP_CONNECT_TIMEOUT_SEC 10
 #define RTSP_RECEIVE_TIMEOUT_SEC 15
@@ -1304,6 +1305,25 @@ int performRtspHandshake(PSERVER_INFORMATION serverInfo) {
                 }
                 else {
                     Limelog("Client roaming: advertised by the host (version %u), disabled in the settings\n", roamingVersion);
+                }
+            }
+        }
+
+        // Frame Warp: the host lists the ids of its control messages in a=x-rl-control lines.
+        // All four must be there, and it only runs on the encrypted control stream of a
+        // Sunshine family host. Without them nothing Frame Warp related is ever sent.
+        {
+            uint32_t controlIds = FrameWarpParseControlIds(response.payload);
+            if (controlIds == FRAME_WARP_IDS_ALL) {
+                if (!StreamConfig.frameWarp) {
+                    Limelog("Frame Warp: advertised by the host, disabled in the settings\n");
+                }
+                else if (!IS_SUNSHINE() || !APP_VERSION_AT_LEAST(7, 1, 431)) {
+                    Limelog("Frame Warp: needs the encrypted control stream, not using it\n");
+                }
+                else {
+                    FrameWarpNegotiated = true;
+                    Limelog("Frame Warp: advertised by the host, enabled\n");
                 }
             }
         }
