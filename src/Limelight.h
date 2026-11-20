@@ -157,7 +157,26 @@ typedef struct _STREAM_CONFIGURATION {
     // when the host advertises it in its RTSP DESCRIBE response; with any other host nothing
     // changes. The bit depth follows supportedVideoFormats: 10-bit when it holds a Main10 format.
     int packed444Modes;
+
+    // Frame Warp: show the camera turn on the next display refresh by shifting every decoded
+    // picture by the input the host's frame has not seen yet. 0 = off (the default). It only takes
+    // effect when the host lists the Frame Warp ids in an a=x-rl-control line of its RTSP DESCRIBE
+    // response and the control stream is the encrypted one; with any other host nothing is sent.
+    int frameWarp;
+
+    // Input stream controller number (0-15) whose right stick turns the camera, or
+    // LI_FRAME_WARP_NO_CONTROLLER (0xFF) for mouse only. See LiSetFrameWarpController().
+    int frameWarpController;
+
+    // LI_FRAME_WARP_FLAG_* bits sent in the request
+    int frameWarpFlags;
+
+    // Widest HUD mask the client takes (cells), at most 2048. 0 = no mask.
+    int frameWarpMaskMaxWidth;
 } STREAM_CONFIGURATION, *PSTREAM_CONFIGURATION;
+
+#define LI_FRAME_WARP_NO_CONTROLLER 0xFF
+#define LI_FRAME_WARP_FLAG_LENS     0x01 // The client draws the picture through the lens (focal length)
 
 #define LI_ROAMING_ENABLED       0x01 // Follow network changes (only if the host advertises roaming)
 #define LI_ROAMING_ALLOW_METERED 0x02 // Also continue on a metered network (mobile data)
@@ -1243,6 +1262,68 @@ int LiGetClientRoamingStatus(void);
 
 // Number of successful moves in this connection.
 uint32_t LiGetClientRoamingCount(void);
+
+// Frame Warp (see STREAM_CONFIGURATION.frameWarp). The request is sent by the library once the
+// control stream runs, and the host then sends the model, the per frame tags and the HUD mask.
+// Everything below is safe to call from any thread, and does nothing when it was not negotiated.
+
+// Returns true when Frame Warp was negotiated: the host listed all of its ids, frameWarp is set
+// and the control stream is encrypted. Valid after the RTSP handshake.
+bool LiIsFrameWarpNegotiated(void);
+
+// Stops (false) or restarts (true) Frame Warp on a running stream, for example while HDR is
+// active. Restarting resets the counts on both sides. Returns 0, or a negative error.
+int LiSetFrameWarpEnabled(bool enabled);
+
+// Changes the tracked controller. While Frame Warp runs this sends a repeated enable request, so
+// the counts on both sides are kept. Returns 0, or a negative error.
+int LiSetFrameWarpController(uint8_t controller);
+
+typedef struct _LI_FRAME_WARP_STATE {
+    bool active;          // Enabled and the model has a lock
+    bool mouseLocked;
+    bool stickLocked;
+    uint16_t generation;  // Of the model
+    uint16_t pictureWidth;  // Encoded stream size the shifts are in
+    uint16_t pictureHeight;
+    float focal;          // Picture pixels, 0 = no lens (always 0 unless the lens flag was sent)
+    uint32_t lagUs;
+    float fit;
+} LI_FRAME_WARP_STATE, *PLI_FRAME_WARP_STATE;
+
+// Fills in the state. Returns false (and zeroes it) when Frame Warp was not negotiated.
+bool LiGetFrameWarpState(PLI_FRAME_WARP_STATE state);
+
+#define LI_FRAME_WARP_TAG_MISSING      0 // No tag for the frame: draw it unshifted
+#define LI_FRAME_WARP_TAG_FOUND        1
+#define LI_FRAME_WARP_TAG_EXTRAPOLATED 2 // From the two tags before it
+
+typedef struct _LI_FRAME_WARP_SHIFT {
+    float x;              // Picture pixels of the stream size, already scaled by fade. The content
+    float y;              // moves, so sample the picture at position - shift (or through the lens).
+    int tagStatus;        // LI_FRAME_WARP_TAG_*
+    float fade;           // 1 while locked, falls to 0 over about 150 ms when the model unlocks
+    uint16_t generation;  // Of the model used, with the values below
+    uint16_t pictureWidth;
+    uint16_t pictureHeight;
+    float focal;
+} LI_FRAME_WARP_SHIFT, *PLI_FRAME_WARP_SHIFT;
+
+// Computes the shift for the picture of video frame frameNumber (DECODE_UNIT.frameNumber) at
+// nowUs (LiGetMicroseconds()). Call it as late as possible before each present, also for repeated
+// presents of the same picture. Returns false (shift zero) when there is nothing to draw: not
+// negotiated, no lock, or the fade is over.
+bool LiGetFrameWarpShift(uint32_t frameNumber, uint64_t nowUs, PLI_FRAME_WARP_SHIFT shift);
+
+// Copies out the HUD mask: one bit per cell, row by row from the top, cell index y * width + x,
+// bit (index & 7) of byte (index >> 3). A set cell stays unshifted. Fills in generation, width and
+// height, and returns the number of bytes the mask takes: 0 means no mask. The bits are copied only
+// when bits is not NULL and capacityBytes is large enough.
+uint32_t LiGetFrameWarpMask(uint16_t* generation, uint16_t* width, uint16_t* height,
+                            uint8_t* bits, uint32_t capacityBytes);
+
+// Counters for the overlay: pictures shifted, extrapolated and drawn unshifted for lack of a tag
+void LiGetFrameWarpCounters(uint32_t* shifted, uint32_t* extrapolated, uint32_t* untagged);
 
 // This function requests an IDR frame from the host. Typically this is done using DR_NEED_IDR, but clients
 // processing frames asynchronously may need to reset their decoder state even after returning DR_OK for

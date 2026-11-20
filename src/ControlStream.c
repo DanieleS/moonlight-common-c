@@ -1,5 +1,6 @@
 #include "Limelight-internal.h"
 #include "ClientRoaming.h"
+#include "FrameWarp.h"
 
 // This is a private header, but it just contains some time macros
 #include <enet/time.h>
@@ -168,6 +169,10 @@ static PPLT_CRYPTO_CONTEXT decryptionCtx;
 #define IDX_TEXT_FOCUS 16
 #define IDX_DYNAMIC_PARAM_CHANGE 17
 #define IDX_RESOLUTION_CHANGE 18
+#define IDX_FRAME_WARP_REQUEST 19
+#define IDX_FRAME_WARP_MODEL 20
+#define IDX_FRAME_WARP_TAGS 21
+#define IDX_FRAME_WARP_MASK 22
 
 #define CONTROL_STREAM_TIMEOUT_SEC 10
 #define CONTROL_STREAM_LINGER_TIMEOUT_SEC 2
@@ -192,6 +197,10 @@ static const short packetTypesGen3[] = {
     -1,     // Text field focus (unused)
     -1,     // Dynamic param change (unused)
     -1,     // Resolution change (unused)
+    -1,     // Frame Warp request (unused)
+    -1,     // Frame Warp model (unused)
+    -1,     // Frame Warp tags (unused)
+    -1,     // Frame Warp HUD mask (unused)
 };
 static const short packetTypesGen4[] = {
     0x0606, // Request IDR frame
@@ -213,6 +222,10 @@ static const short packetTypesGen4[] = {
     -1,     // Text field focus (unused)
     -1,     // Dynamic param change (unused)
     -1,     // Resolution change (unused)
+    -1,     // Frame Warp request (unused)
+    -1,     // Frame Warp model (unused)
+    -1,     // Frame Warp tags (unused)
+    -1,     // Frame Warp HUD mask (unused)
 };
 static const short packetTypesGen5[] = {
     0x0305, // Start A
@@ -234,6 +247,10 @@ static const short packetTypesGen5[] = {
     -1,     // Text field focus (unused)
     -1,     // Dynamic param change (unused)
     -1,     // Resolution change (unused)
+    -1,     // Frame Warp request (unused)
+    -1,     // Frame Warp model (unused)
+    -1,     // Frame Warp tags (unused)
+    -1,     // Frame Warp HUD mask (unused)
 };
 static const short packetTypesGen7[] = {
     0x0305, // Start A
@@ -255,6 +272,10 @@ static const short packetTypesGen7[] = {
     -1,     // Text field focus (unused)
     -1,     // Dynamic param change (unused)
     -1,     // Resolution change (unused)
+    -1,     // Frame Warp request (unused)
+    -1,     // Frame Warp model (unused)
+    -1,     // Frame Warp tags (unused)
+    -1,     // Frame Warp HUD mask (unused)
 };
 static const short packetTypesGen7Enc[] = {
     0x0302, // Request IDR frame
@@ -276,6 +297,10 @@ static const short packetTypesGen7Enc[] = {
     SS_TEXT_FOCUS_PTYPE, // Text field focus (Vibepollo protocol extension)
     0x5506, // Dynamic param change (Foundation Sunshine protocol extension)
     0x5507, // Resolution change (Foundation Sunshine protocol extension)
+    FRAME_WARP_ID_REQUEST, // Frame Warp request (Rubylight protocol extension)
+    FRAME_WARP_ID_MODEL, // Frame Warp model (Rubylight protocol extension)
+    FRAME_WARP_ID_TAGS, // Frame Warp frame tags (Rubylight protocol extension)
+    FRAME_WARP_ID_MASK, // Frame Warp HUD mask (Rubylight protocol extension)
 };
 
 static const char requestIdrFrameGen3[] = { 0, 0 };
@@ -373,6 +398,7 @@ int initializeControlStream(void) {
     fecSummaryLastSentMs = PltGetMillis();
 
     encryptedControlStream = APP_VERSION_AT_LEAST(7, 1, 431);
+    FrameWarpInitialize();
 
     if (AppVersionQuad[0] == 3) {
         packetTypes = (short*)packetTypesGen3;
@@ -441,6 +467,7 @@ static void freeBasicLbqList(PLINKED_BLOCKING_QUEUE_ENTRY entry) {
 // Cleans up control stream
 void destroyControlStream(void) {
     LC_ASSERT(stopping);
+    FrameWarpDestroy();
     PltDestroyCryptoContext(encryptionCtx);
     PltDestroyCryptoContext(decryptionCtx);
     PltCloseEvent(&idrFrameRequiredEvent);
@@ -974,6 +1001,42 @@ static bool sendMessageAndDiscardReply(short ptype, short paylen, const void* pa
     return true;
 }
 
+// Whether the Frame Warp request can go out on this stream: negotiated, and the encrypted
+// control stream (version 2) is really what the connection uses.
+static bool canSendFrameWarpRequest(void) {
+    return FrameWarpNegotiated && IS_SUNSHINE() && encryptedControlStream && AppVersionQuad[0] >= 7 &&
+           (EncryptionFeaturesEnabled & SS_ENC_CONTROL_V2) && packetTypes != NULL &&
+           packetTypes[IDX_FRAME_WARP_REQUEST] != -1 && peer != NULL &&
+           peer->state == ENET_PEER_STATE_CONNECTED;
+}
+
+// Sends the 0x5543 request, reliably on the generic channel. An enable that starts Frame Warp
+// resets the counts on this side, a repeated one keeps them.
+static int sendFrameWarpRequest(bool enabled, uint8_t controller) {
+    uint8_t payload[FRAME_WARP_REQUEST_SIZE];
+
+    if (!canSendFrameWarpRequest()) {
+        return LI_ERR_UNSUPPORTED;
+    }
+    if (!FrameWarpPrepareRequest(enabled, controller)) {
+        return LI_ERR_UNSUPPORTED;
+    }
+
+    FrameWarpEncodeRequest(payload, enabled, controller, (uint8_t)(StreamConfig.frameWarpFlags & 0xFF),
+                           (uint16_t)(StreamConfig.frameWarpMaskMaxWidth < 0 ? 0 :
+                                      StreamConfig.frameWarpMaskMaxWidth > FRAME_WARP_MASK_MAX_DIM ?
+                                      FRAME_WARP_MASK_MAX_DIM : StreamConfig.frameWarpMaskMaxWidth));
+    if (!sendMessageAndForget(packetTypes[IDX_FRAME_WARP_REQUEST], sizeof(payload), payload,
+                              CTRL_CHANNEL_GENERIC, ENET_PACKET_FLAG_RELIABLE, false)) {
+        if (enabled) {
+            FrameWarpRequestFailed();
+        }
+        return -1;
+    }
+
+    return 0;
+}
+
 // This intercept function drops disconnect events to allow us to process
 // pending receives first. It works around what appears to be a bug in ENet
 // where pending disconnects can cause loss of unprocessed received data.
@@ -1339,6 +1402,42 @@ static void queueAsyncCallback(PNVCTL_ENET_PACKET_HEADER_V1 ctlHdr, int packetLe
     }
 }
 
+// Frame Warp messages only exist on the encrypted control stream, where the type table has them
+static bool isFrameWarpPacket(unsigned short packetType) {
+    return encryptedControlStream && AppVersionQuad[0] >= 7 &&
+           (packetType == packetTypes[IDX_FRAME_WARP_MODEL] ||
+            packetType == packetTypes[IDX_FRAME_WARP_TAGS] ||
+            packetType == packetTypes[IDX_FRAME_WARP_MASK]);
+}
+
+static void handleFrameWarpPacket(PNVCTL_ENET_PACKET_HEADER_V1 ctlHdr, int packetLength) {
+    const uint8_t* payload = (const uint8_t*)(ctlHdr + 1);
+    int payloadLength = packetLength - (int)sizeof(*ctlHdr);
+
+    // A host that didn't announce it, or a client that didn't ask, gets nothing from us. A
+    // message that breaks a rule is dropped by the handlers.
+    if (!FrameWarpNegotiated || !(EncryptionFeaturesEnabled & SS_ENC_CONTROL_V2) || payloadLength < 0) {
+        static bool loggedUnrequested;
+
+        // Only touched on this thread, and the flag is harmlessly sticky across connections
+        if (!loggedUnrequested) {
+            loggedUnrequested = true;
+            Limelog("Ignoring a Frame Warp message the host sent without being asked\n");
+        }
+        return;
+    }
+
+    if (ctlHdr->type == packetTypes[IDX_FRAME_WARP_MODEL]) {
+        FrameWarpHandleModel(payload, payloadLength);
+    }
+    else if (ctlHdr->type == packetTypes[IDX_FRAME_WARP_TAGS]) {
+        FrameWarpHandleTags(payload, payloadLength);
+    }
+    else {
+        FrameWarpHandleMask(payload, payloadLength);
+    }
+}
+
 static void controlReceiveThreadFunc(void* context) {
     int err;
 
@@ -1537,6 +1636,11 @@ static void controlReceiveThreadFunc(void* context) {
             // Process client callbacks in a separate thread
             if (needsAsyncCallback(ctlHdr->type)) {
                 queueAsyncCallback(ctlHdr, packetLength);
+            }
+            else if (isFrameWarpPacket(ctlHdr->type)) {
+                // Handled right here rather than through the async callback queue: the tags are
+                // latency critical and must not wait behind rumble and other blocking callbacks.
+                handleFrameWarpPacket(ctlHdr, packetLength);
             }
             else if (ctlHdr->type == packetTypes[IDX_TERMINATION]) {
                 BYTE_BUFFER bb;
@@ -1915,6 +2019,12 @@ static void requestIdrFrameFunc(void* context) {
 
 // Stops the control stream
 int stopControlStream(void) {
+    // Tell the host to stop while the stream still runs. If it is already gone the host drops
+    // Frame Warp with the session anyway.
+    if (FrameWarpIsEnabled()) {
+        sendFrameWarpRequest(false, FrameWarpGetController());
+    }
+
     stopping = true;
     LbqSignalQueueShutdown(&referenceFrameControlQueue);
     LbqSignalQueueShutdown(&frameFecStatusQueue);
@@ -2463,6 +2573,15 @@ int startControlStream(void) {
         }
     }
 
+    // The stream runs now (START B is done): ask the host for Frame Warp. A failure here is not
+    // an error of the stream, it just runs without.
+    if (FrameWarpNegotiated) {
+        int fwErr = sendFrameWarpRequest(true, (uint8_t)StreamConfig.frameWarpController);
+        if (fwErr != 0) {
+            Limelog("Frame Warp: request not sent (%d)\n", fwErr);
+        }
+    }
+
     return 0;
 }
 
@@ -2523,6 +2642,37 @@ int LiRequestResolutionChange(int width, int height) {
     payload[2] = LE32((uint32_t)height);
     return sendMessageAndForget(packetTypes[IDX_DYNAMIC_PARAM_CHANGE], sizeof(payload), payload,
                                 CTRL_CHANNEL_GENERIC, ENET_PACKET_FLAG_RELIABLE, false) ? 0 : -4;
+}
+
+int LiSetFrameWarpEnabled(bool enabled) {
+    if (stopping) {
+        return -3;
+    }
+
+    // The counts restart with an enable that starts Frame Warp, and the stop is harmless when
+    // it isn't running
+    if (!enabled && !FrameWarpIsEnabled()) {
+        return 0;
+    }
+
+    return sendFrameWarpRequest(enabled, FrameWarpGetController());
+}
+
+int LiSetFrameWarpController(uint8_t controller) {
+    if (controller > 15 && controller != LI_FRAME_WARP_NO_CONTROLLER) {
+        return -1;
+    }
+    if (stopping) {
+        return -3;
+    }
+
+    // Not running: it is picked up by the next enable
+    if (!FrameWarpIsEnabled()) {
+        return FrameWarpPrepareRequest(false, controller) ? 0 : LI_ERR_UNSUPPORTED;
+    }
+
+    // A repeated enable keeps the counts on both sides
+    return sendFrameWarpRequest(true, controller);
 }
 
 int LiSendCaptureAction(uint8_t action) {
